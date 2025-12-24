@@ -1,0 +1,40 @@
+[project]
+name = "agentforge"
+version = "0.1.0"
+description = "Agent that can use tools and create tools with an OpenAI-compatible backend."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "AgentForge" }]
+dependencies = [
+  "pydantic>=2",
+  "pydantic-settings>=2",
+  "httpx",
+  "rich",
+  "fastapi",
+  "uvicorn",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+agentforge = "agentforge.cli:main"
+
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agentforge"]
