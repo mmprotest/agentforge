@@ -4,9 +4,10 @@ AgentForge is a production-ready Python 3.11+ repository that implements an agen
 
 ## Features
 - OpenAI-compatible REST client (`/chat/completions`) with configurable base URL.
-- Built-in tools: HTTP fetch, workspace filesystem, Python sandbox, deep thinking planner.
+- Built-in tools: HTTP fetch, workspace filesystem, Python sandbox, deep thinking planner, calculator, regex extract, unit conversion, JSON repair, multi-file code runner.
 - Tool registry and validation pipeline for safe tool creation.
 - CLI and FastAPI server.
+- Eval harness with trace/replay support.
 
 ## Quickstart
 
@@ -30,6 +31,18 @@ export OPENAI_MODEL=gpt-4.1-mini
 python -m agentforge "Summarize the weather" --base-url https://api.openai.com/v1
 ```
 
+#### Local OpenAI-compatible servers
+The client accepts a base URL with or without `/v1`:
+```bash
+export OPENAI_BASE_URL=http://localhost:8000
+python -m agentforge "hello"
+```
+You can also supply extra headers or override the path:
+```bash
+export OPENAI_EXTRA_HEADERS='{"X-Provider": "local"}'
+export OPENAI_FORCE_CHATCOMPLETIONS_PATH=/v1/chat/completions
+```
+
 ### Start the API
 ```bash
 uvicorn agentforge.api:app --reload
@@ -41,9 +54,21 @@ Environment variables (CLI flags override env vars):
 - `OPENAI_BASE_URL` (default `https://api.openai.com/v1`)
 - `OPENAI_MODEL` (default `gpt-4.1-mini`)
 - `OPENAI_TIMEOUT_SECONDS` (default `30`)
+- `OPENAI_EXTRA_HEADERS` (JSON string of headers)
+- `OPENAI_DISABLE_TOOL_CHOICE` (default `false`)
+- `OPENAI_FORCE_CHATCOMPLETIONS_PATH` (optional override)
 - `AGENT_MODE` (default `direct`)
 - `ALLOW_TOOL_CREATION` (default `false`)
 - `WORKSPACE_DIR` (default `./workspace`)
+- `MAX_TOOL_OUTPUT_CHARS` (default `4000`)
+- `KEEP_RAW_TOOL_OUTPUT` (default `true`)
+- `SUMMARY_LINES` (default `10`)
+- `MAX_MODEL_CALLS` (default `20`)
+
+Recommended small-model settings:
+```bash
+python -m agentforge "Question" --self-consistency 2 --verify --summary-lines 8
+```
 
 ## Tool creation gating
 Tool creation is disabled by default. Enable it by setting `ALLOW_TOOL_CREATION=true` or using `--allow-tool-creation`. Generated tools are validated with AST-based checks and executed in a sandboxed test process before registration.
@@ -53,6 +78,7 @@ AgentForge assumes:
 - Untrusted model output: tool code and arguments are validated and sandboxed.
 - Tools are confined: filesystem access is limited to the workspace, Python sandbox blocks imports and enforces timeouts.
 - Network exposure is explicit: only the `http_fetch` tool can perform outbound requests.
+- `code_run_multi` executes code in a temporary workspace directory; do not provide secrets or untrusted system commands.
 - Secrets are redacted in logs where possible.
 
 ## Development
