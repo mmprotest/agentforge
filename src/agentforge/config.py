@@ -52,6 +52,9 @@ class Settings(BaseSettings):
         default=6000, validation_alias="MAX_MESSAGE_TOKENS_APPROX"
     )
     token_char_ratio: int = Field(default=4, validation_alias="TOKEN_CHAR_RATIO")
+    max_single_message_chars: int = Field(
+        default=4000, validation_alias="MAX_SINGLE_MESSAGE_CHARS"
+    )
     max_turns: int = Field(default=20, validation_alias="MAX_TURNS")
     trim_strategy: Literal["drop_oldest"] = Field(
         default="drop_oldest", validation_alias="TRIM_STRATEGY"

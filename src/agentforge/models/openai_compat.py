@@ -35,8 +35,7 @@ class OpenAICompatChatModel(BaseChatModel):
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         normalized = base_url.strip()
-        self._missing_scheme = not normalized.startswith(("http://", "https://"))
-        if self._missing_scheme:
+        if not normalized.startswith(("http://", "https://")):
             normalized = f"http://{normalized}"
         self.base_url = normalized.rstrip("/")
         self.api_key = api_key
@@ -88,14 +87,18 @@ class OpenAICompatChatModel(BaseChatModel):
             if not forced_path.startswith("/"):
                 forced_path = f"/{forced_path}"
             return urlunparse(parsed._replace(path=forced_path, params="", query="", fragment=""))
-        base_path = parsed.path.rstrip("/")
-        if not base_path and self._missing_scheme:
-            root_path = ""
-        elif base_path.endswith("/v1"):
-            root_path = base_path
+        path = parsed.path or ""
+        if path in {"", "/"}:
+            base_path = "/v1"
         else:
-            root_path = f"{base_path}/v1" if base_path else "/v1"
-        final_path = f"{root_path}/chat/completions" if root_path else "/chat/completions"
+            base_path = path.rstrip("/")
+            segments = [segment for segment in base_path.split("/") if segment]
+            if "v1" not in segments:
+                base_path = f"{base_path}/v1"
+        if base_path.endswith("/chat/completions"):
+            final_path = base_path
+        else:
+            final_path = f"{base_path}/chat/completions"
         return urlunparse(parsed._replace(path=final_path, params="", query="", fragment=""))
 
     def _fallback_tool_call(self, content: str) -> ToolCall | None:

@@ -32,7 +32,7 @@ python -m agentforge "Summarize the weather" --base-url https://api.openai.com/v
 ```
 
 #### Local OpenAI-compatible servers
-The client accepts a base URL with or without `/v1`:
+The client accepts a base URL with or without `/v1`. If the base URL has no path, `/v1` is added automatically:
 ```bash
 export OPENAI_BASE_URL=http://localhost:8000
 python -m agentforge "hello"
@@ -65,6 +65,7 @@ Environment variables (CLI flags override env vars):
 - `SUMMARY_LINES` (default `10`)
 - `MAX_MODEL_CALLS` (default `20`)
 - `MAX_MESSAGE_CHARS` (default `24000`)
+- `MAX_SINGLE_MESSAGE_CHARS` (default `4000`)
 - `MAX_MESSAGE_TOKENS_APPROX` (default `6000`)
 - `TOKEN_CHAR_RATIO` (default `4`)
 - `MAX_TURNS` (default `20`)
@@ -86,7 +87,8 @@ python -m agentforge "Write code" --strict-json --code-check --max-message-chars
 
 Strict JSON mode enforces a single JSON object response and retries once on format errors.
 Context trimming keeps recent requests and tool summaries within a hard budget, which helps smaller
-local models stay focused. Sandbox execution now sanitizes environment variables by default.
+local models stay focused. Single messages are hard-truncated to `MAX_SINGLE_MESSAGE_CHARS` before
+budget trimming. Sandbox execution now sanitizes environment variables by default.
 
 ## Tool creation gating
 Tool creation is disabled by default. Enable it by setting `ALLOW_TOOL_CREATION=true` or using `--allow-tool-creation`. Generated tools are validated with AST-based checks and executed in a sandboxed test process before registration.

@@ -58,6 +58,7 @@ class Agent:
         max_message_chars: int = 24000,
         max_message_tokens_approx: int = 6000,
         token_char_ratio: int = 4,
+        max_single_message_chars: int = 4000,
         max_turns: int = 20,
         trim_strategy: str = "drop_oldest",
         code_check: bool = False,
@@ -76,6 +77,7 @@ class Agent:
         self.max_message_chars = max_message_chars
         self.max_message_tokens_approx = max_message_tokens_approx
         self.token_char_ratio = token_char_ratio
+        self.max_single_message_chars = max_single_message_chars
         self.max_turns = max_turns
         self.trim_strategy = trim_strategy
         self.code_check = code_check
@@ -122,6 +124,7 @@ class Agent:
                 self.max_turns,
                 self.max_message_tokens_approx,
                 self.token_char_ratio,
+                self.max_single_message_chars,
             )
 
     def run(self, query: str) -> AgentResult:
@@ -182,6 +185,7 @@ class Agent:
         last_tool_summary: str | None = None
         last_parse_failed: str | None = None
         retry_instruction: dict[str, Any] | None = None
+        format_retry_message: dict[str, Any] | None = None
         format_retry_remaining = 1 if self.strict_json_mode else 0
         code_check_enabled = self.code_check and is_code_task(query)
         for _ in range(self.policy.max_tool_calls):
@@ -222,6 +226,9 @@ class Agent:
             if retry_instruction is not None:
                 call_messages.append(retry_instruction)
                 retry_instruction = None
+            if format_retry_message is not None:
+                call_messages.append(format_retry_message)
+                format_retry_message = None
             tools = self.registry.openai_schemas()
             if self._model_calls >= self.max_model_calls:
                 break
@@ -239,15 +246,7 @@ class Agent:
                 protocol = self._parse_model_protocol(response.final_text)
                 if protocol is None and self.strict_json_mode:
                     if format_retry_remaining > 0:
-                        self._append_message(
-                            {
-                                "role": "system",
-                                "content": (
-                                    "Format error: respond with exactly one JSON object "
-                                    "and nothing else."
-                                ),
-                            }
-                        )
+                        format_retry_message = self._build_format_retry_message()
                         format_retry_remaining -= 1
                         last_parse_failed = response.final_text
                         continue
@@ -519,6 +518,22 @@ class Agent:
             "Return ONLY a tool call JSON object with corrected arguments."
         )
         return {"role": "user", "content": content}
+
+    def _build_format_retry_message(self) -> dict[str, Any]:
+        tool_example = {"type": "tool", "name": "tool_name", "arguments": {}}
+        final_example = {
+            "type": "final",
+            "answer": "ok",
+            "confidence": 0.5,
+            "checks": [],
+        }
+        content = (
+            "Format error: previous response was not valid JSON. "
+            "Return ONLY a single JSON object matching the protocol.\n"
+            f"Tool example: {json.dumps(tool_example)}\n"
+            f"Final example: {json.dumps(final_example)}"
+        )
+        return {"role": "system", "content": content}
 
     def _example_value(self, schema: dict[str, Any]) -> Any:
         schema_type = schema.get("type")

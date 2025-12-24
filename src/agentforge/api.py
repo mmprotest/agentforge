@@ -44,6 +44,7 @@ class RunRequest(BaseModel):
     code_check: bool | None = None
     code_check_max_iters: int | None = None
     max_message_chars: int | None = None
+    max_single_message_chars: int | None = None
     max_turns: int | None = None
 
 
@@ -111,6 +112,8 @@ async def run_agent(request: RunRequest) -> RunResponse:
         settings.code_check_max_iters = request.code_check_max_iters
     if request.max_message_chars is not None:
         settings.max_message_chars = request.max_message_chars
+    if request.max_single_message_chars is not None:
+        settings.max_single_message_chars = request.max_single_message_chars
     if request.max_turns is not None:
         settings.max_turns = request.max_turns
     model = build_model(settings)
@@ -136,6 +139,7 @@ async def run_agent(request: RunRequest) -> RunResponse:
         max_message_chars=settings.max_message_chars,
         max_message_tokens_approx=settings.max_message_tokens_approx,
         token_char_ratio=settings.token_char_ratio,
+        max_single_message_chars=settings.max_single_message_chars,
         max_turns=settings.max_turns,
         trim_strategy=settings.trim_strategy,
         code_check=settings.code_check,
