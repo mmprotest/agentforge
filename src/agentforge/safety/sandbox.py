@@ -49,7 +49,7 @@ def run_pytest(test_path: Path, timeout_seconds: int = 20) -> SandboxResult:
     """Run pytest for a specific test file in a subprocess."""
     repo_root = Path(__file__).resolve().parents[3]
     src_path = repo_root / "src"
-    env = os.environ.copy()
+    env = sanitize_env(os.environ.copy())
     existing_path = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{existing_path}{os.pathsep if existing_path else ''}{src_path}"
     process = subprocess.run(

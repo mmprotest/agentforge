@@ -19,7 +19,7 @@ from agentforge.protocol import (
     parse_protocol,
     protocol_from_payload,
 )
-from agentforge.memory import MemoryStore
+from agentforge.memory import MemoryEntry, MemoryStore
 from agentforge.routing import is_code_task, suggest_tool
 from agentforge.safety.policy import SafetyPolicy
 from agentforge.trace import TraceRecorder
@@ -89,9 +89,25 @@ class Agent:
             plan = result.output
         else:
             plan = {"plan": ["Use available tools"], "checks": []}
-        self._append_message(
-            {"role": "system", "content": f"Internal plan (do not reveal): {plan}"}
-        )
+        self.memory.state["plan"] = plan
+        if self.trace:
+            self.trace.record("internal_plan", {"plan": plan})
+
+    def _build_router_prompt(
+        self,
+        query: str,
+        last_tool_summary: str | None,
+        last_parse_failed: str | None,
+    ) -> str:
+        parts = [f"User query: {query}"]
+        facts = self.memory.state.get("facts")
+        if isinstance(facts, list) and facts:
+            parts.append(f"Known facts: {'; '.join(facts)}")
+        if last_tool_summary:
+            parts.append(f"Last tool summary: {last_tool_summary}")
+        if last_parse_failed:
+            parts.append("Previous model output failed to parse as JSON.")
+        return "\n".join(parts)
 
     def _append_message(self, message: dict[str, Any]) -> None:
         self._messages.append(message)
@@ -155,32 +171,42 @@ class Agent:
         if self.trace:
             self.trace.record_messages(self._messages)
 
-        used_router = False
+        last_tool_summary: str | None = None
+        last_parse_failed: str | None = None
         format_retry_remaining = 1 if self.strict_json_mode else 0
         code_check_enabled = self.code_check and is_code_task(query)
         for _ in range(self.policy.max_tool_calls):
-            suggestion = suggest_tool(query) if not used_router else None
-            if suggestion and suggestion.confidence >= 0.8:
-                direct_args = self._direct_tool_args(suggestion.tool_name, query)
-                if direct_args is not None:
-                    tool = self.registry.get(suggestion.tool_name)
-                    if tool and self.policy.is_tool_allowed(suggestion.tool_name):
-                        output, ok = self._execute_tool(tool, direct_args)
-                        self._handle_tool_result(
-                            suggestion.tool_name, output, None, direct_args
-                        )
-                        used_router = True
-                        if ok is False:
-                            continue
+            routing_prompt = self._build_router_prompt(
+                query, last_tool_summary, last_parse_failed
+            )
+            suggestion = suggest_tool(routing_prompt)
+            direct_args = None
+            if suggestion:
+                direct_args = suggestion.suggested_args or self._direct_tool_args(
+                    suggestion.tool_name, query, last_parse_failed
+                )
+            if suggestion and suggestion.confidence >= 0.85 and direct_args is not None:
+                tool = self.registry.get(suggestion.tool_name)
+                if tool and self.policy.is_tool_allowed(suggestion.tool_name):
+                    output, ok = self._execute_tool(tool, direct_args)
+                    entry = self._handle_tool_result(
+                        suggestion.tool_name, output, None, direct_args
+                    )
+                    last_tool_summary = entry.summary
+                    last_parse_failed = None
+                    if ok is False:
                         continue
-            if suggestion and not used_router:
+                    continue
+            if suggestion and suggestion.confidence >= 0.6:
                 self._append_message(
                     {
                         "role": "system",
-                        "content": f"Router suggestion: {suggestion.tool_name} ({suggestion.reason}).",
+                        "content": (
+                            "Router hint: consider using "
+                            f"{suggestion.tool_name} ({suggestion.reason})."
+                        ),
                     }
                 )
-                used_router = True
             tools = self.registry.openai_schemas()
             if self._model_calls >= self.max_model_calls:
                 break
@@ -208,7 +234,9 @@ class Agent:
                             }
                         )
                         format_retry_remaining -= 1
+                        last_parse_failed = response.final_text
                         continue
+                    last_parse_failed = response.final_text
                     return AgentResult(
                         answer="Could not parse the model output as JSON.",
                         tools_used=self.tools_used,
@@ -263,9 +291,11 @@ class Agent:
                     trace_path=self._finalize_trace(),
                 )
             output, ok = self._execute_tool(tool, response.tool_call.arguments)
-            self._handle_tool_result(
+            entry = self._handle_tool_result(
                 tool_name, output, response.tool_call.id, response.tool_call.arguments
             )
+            last_tool_summary = entry.summary
+            last_parse_failed = None
             if ok is False:
                 continue
         return AgentResult(
@@ -281,7 +311,7 @@ class Agent:
         output: Any,
         call_id: str | None = None,
         arguments: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> MemoryEntry:
         if tool_name not in self.tools_used:
             self.tools_used.append(tool_name)
         if tool_name == "tool_maker":
@@ -305,8 +335,14 @@ class Agent:
             if arguments is not None:
                 self.trace.record_tool_call(tool_name, arguments)
             self.trace.record_tool_result(tool_name, entry.handle, entry.summary)
+        return entry
 
-    def _direct_tool_args(self, tool_name: str, query: str) -> dict[str, Any] | None:
+    def _direct_tool_args(
+        self,
+        tool_name: str,
+        query: str,
+        last_parse_failed: str | None,
+    ) -> dict[str, Any] | None:
         if tool_name == "calculator":
             matches = re.findall(r"[0-9\.\s\+\-\*\/\(\)]+", query)
             if matches:
@@ -315,11 +351,23 @@ class Agent:
                     return {"expression": expression}
             return {"expression": query.strip()}
         if tool_name == "json_repair":
-            return {"text": query}
+            if last_parse_failed:
+                return {"text": last_parse_failed}
+            if re.search(r"\bfix json\b", query, re.IGNORECASE):
+                return {"text": query}
+            return None
         if tool_name == "http_fetch":
             match = re.search(r"https?://\S+", query)
             if match:
                 return {"url": match.group(0)}
+        if tool_name == "regex_extract":
+            pattern_match = re.search(r"/(.+?)/", query)
+            if pattern_match:
+                pattern = pattern_match.group(1)
+            else:
+                pattern_match = re.search(r"pattern\s*[:=]\s*(\S+)", query, re.IGNORECASE)
+                pattern = pattern_match.group(1) if pattern_match else r".+"
+            return {"pattern": pattern, "text": query}
         if tool_name == "unit_convert":
             match = re.search(
                 r"convert\s+([0-9]*\.?[0-9]+)\s*([a-zA-Z]+)\s+to\s+([a-zA-Z]+)",

@@ -23,8 +23,13 @@ class MemoryStore:
     summary_lines: int = 10
     raw_outputs: dict[str, Any] = field(default_factory=dict)
     entries: list[MemoryEntry] = field(default_factory=list)
-    state: dict[str, list[str]] = field(
-        default_factory=lambda: {"facts": [], "intermediate_results": [], "assumptions": []}
+    state: dict[str, Any] = field(
+        default_factory=lambda: {
+            "facts": [],
+            "intermediate_results": [],
+            "assumptions": [],
+            "plan": None,
+        }
     )
 
     def add_tool_output(self, tool_name: str, output: Any) -> MemoryEntry:
@@ -46,7 +51,10 @@ class MemoryStore:
             return f"tool-{uuid4().hex[:12]}"
 
     def _summarize_output(self, tool_name: str, output: Any) -> str:
-        text = json.dumps(output, ensure_ascii=False, indent=2)
+        try:
+            text = json.dumps(output, ensure_ascii=False, indent=2)
+        except TypeError:
+            text = repr(output)
         clipped = text[: self.max_tool_output_chars]
         lines = [line.strip() for line in clipped.splitlines() if line.strip()]
         if not lines:

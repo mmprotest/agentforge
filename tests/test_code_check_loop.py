@@ -38,3 +38,26 @@ result = 1 + 1
     )
     result = agent.run("write code to add numbers")
     assert "1 + 1" in result.answer
+
+
+def test_code_check_allows_basic_imports(tmp_path):
+    snippet = """```python
+from typing import List
+from collections import Counter
+result = Counter(["a", "a", "b"])
+```"""
+    payload = json.dumps(
+        {"type": "final", "answer": snippet, "confidence": 0.2, "checks": []}
+    )
+    model = MockChatModel(scripted=[ModelResponse(final_text=payload)])
+    registry = ToolRegistry()
+    registry.register(PythonSandboxTool(str(tmp_path)))
+    agent = Agent(
+        model=model,
+        registry=registry,
+        policy=SafetyPolicy(max_model_calls=2),
+        code_check=True,
+        code_check_max_iters=1,
+    )
+    result = agent.run("write python code")
+    assert "Counter" in result.answer
