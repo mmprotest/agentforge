@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from typing import Any
 
 from agentforge.models.base import BaseChatModel
@@ -105,9 +106,8 @@ class Agent:
             self._messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": tool_name,
-                    "name": tool_name,
-                    "content": str(result.output),
+                    "tool_call_id": response.tool_call.id or tool_name,
+                    "content": json.dumps(result.output),
                 }
             )
         return AgentResult(
