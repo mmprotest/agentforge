@@ -2,18 +2,28 @@
 
 from __future__ import annotations
 
+import json
+from uuid import uuid4
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 
 from agentforge.agent import Agent
 from agentforge.config import Settings
+from agentforge.memory import MemoryStore
 from agentforge.models.mock import MockChatModel
 from agentforge.models.openai_compat import OpenAICompatChatModel
 from agentforge.safety.policy import SafetyPolicy
+from agentforge.trace import TraceRecorder
+from agentforge.tools.builtins.calculator import CalculatorTool
+from agentforge.tools.builtins.code_run_multi import CodeRunMultiTool
 from agentforge.tools.builtins.deep_think import DeepThinkTool
 from agentforge.tools.builtins.filesystem import FileSystemTool
 from agentforge.tools.builtins.http_fetch import HttpFetchTool
+from agentforge.tools.builtins.json_repair import JsonRepairTool
 from agentforge.tools.builtins.python_sandbox import PythonSandboxTool
+from agentforge.tools.builtins.regex_extract import RegexExtractTool
+from agentforge.tools.builtins.unit_convert import UnitConvertTool
 from agentforge.tools.registry import ToolRegistry
 from agentforge.tools.tool_maker import ToolMaker, ToolMakerTool
 
@@ -26,22 +36,33 @@ class RunRequest(BaseModel):
     allow_tool_creation: bool | None = None
     base_url: str | None = None
     model: str | None = None
+    verify: bool | None = None
+    self_consistency: int | None = None
+    max_model_calls: int | None = None
+    summary_lines: int | None = None
 
 
 class RunResponse(BaseModel):
     answer: str
     tool_calls: list[str]
     tools_created: list[str]
+    trace_path: str | None = None
 
 
 def build_model(settings: Settings):
     if not settings.openai_api_key:
         return MockChatModel()
+    extra_headers = None
+    if settings.openai_extra_headers:
+        extra_headers = json.loads(settings.openai_extra_headers)
     return OpenAICompatChatModel(
         base_url=settings.openai_base_url,
         api_key=settings.openai_api_key,
         model=settings.openai_model,
         timeout_seconds=settings.openai_timeout_seconds,
+        extra_headers=extra_headers,
+        disable_tool_choice=settings.openai_disable_tool_choice,
+        force_chatcompletions_path=settings.openai_force_chatcompletions_path,
     )
 
 
@@ -51,6 +72,11 @@ def build_registry(settings: Settings, model) -> ToolRegistry:
     registry.register(FileSystemTool(settings.workspace_dir))
     registry.register(PythonSandboxTool(settings.workspace_dir))
     registry.register(DeepThinkTool())
+    registry.register(CalculatorTool())
+    registry.register(RegexExtractTool())
+    registry.register(UnitConvertTool())
+    registry.register(CodeRunMultiTool(settings.workspace_dir))
+    registry.register(JsonRepairTool())
     if settings.allow_tool_creation:
         maker = ToolMaker(model, settings.workspace_dir)
         registry.register(ToolMakerTool(maker, registry))
@@ -68,10 +94,34 @@ async def run_agent(request: RunRequest) -> RunResponse:
         settings.agent_mode = request.mode
     if request.allow_tool_creation is not None:
         settings.allow_tool_creation = request.allow_tool_creation
+    if request.summary_lines is not None:
+        settings.summary_lines = request.summary_lines
+    if request.max_model_calls is not None:
+        settings.max_model_calls = request.max_model_calls
     model = build_model(settings)
     registry = build_registry(settings, model)
-    agent = Agent(model=model, registry=registry, policy=SafetyPolicy(), mode=settings.agent_mode)
+    memory = MemoryStore(
+        max_tool_output_chars=settings.max_tool_output_chars,
+        keep_raw_tool_output=settings.keep_raw_tool_output,
+        summary_lines=settings.summary_lines,
+    )
+    policy = SafetyPolicy(max_model_calls=settings.max_model_calls)
+    trace = TraceRecorder(trace_id=f"api-{uuid4().hex[:8]}", workspace_dir=settings.workspace_dir)
+    agent = Agent(
+        model=model,
+        registry=registry,
+        policy=policy,
+        mode=settings.agent_mode,
+        verify=bool(request.verify),
+        self_consistency=request.self_consistency or 1,
+        max_model_calls=settings.max_model_calls,
+        memory=memory,
+        trace=trace,
+    )
     result = agent.run(request.query)
     return RunResponse(
-        answer=result.answer, tool_calls=result.tools_used, tools_created=result.tools_created
+        answer=result.answer,
+        tool_calls=result.tools_used,
+        tools_created=result.tools_created,
+        trace_path=result.trace_path,
     )

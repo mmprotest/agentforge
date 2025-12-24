@@ -15,6 +15,35 @@ class SandboxResult:
     output: str
 
 
+@dataclass
+class SandboxCommandResult:
+    stdout: str
+    stderr: str
+    exit_code: int
+
+
+def run_command(
+    command: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    timeout_seconds: int = 20,
+) -> SandboxCommandResult:
+    """Run a command in a subprocess."""
+    process = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        cwd=cwd,
+        env=env,
+    )
+    return SandboxCommandResult(
+        stdout=process.stdout or "",
+        stderr=process.stderr or "",
+        exit_code=process.returncode,
+    )
+
+
 def run_pytest(test_path: Path, timeout_seconds: int = 20) -> SandboxResult:
     """Run pytest for a specific test file in a subprocess."""
     repo_root = Path(__file__).resolve().parents[3]

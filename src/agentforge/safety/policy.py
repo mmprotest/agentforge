@@ -10,6 +10,7 @@ class SafetyPolicy:
     max_tool_calls: int = 6
     max_tool_creations: int = 1
     max_runtime_seconds: int = 60
+    max_model_calls: int = 20
     allow_tools: list[str] | None = None
 
     def is_tool_allowed(self, name: str) -> bool:
