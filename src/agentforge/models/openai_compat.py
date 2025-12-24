@@ -40,6 +40,7 @@ class OpenAICompatChatModel(BaseChatModel):
         if not tool_calls:
             return None
         call = tool_calls[0]
+        call_id = call.get("id")
         function = call.get("function") or {}
         name = function.get("name")
         raw_args = function.get("arguments") or "{}"
@@ -55,7 +56,7 @@ class OpenAICompatChatModel(BaseChatModel):
             arguments = {"raw": raw_args}
         if not name:
             return None
-        return ToolCall(name=name, arguments=arguments)
+        return ToolCall(id=call_id, name=name, arguments=arguments)
 
     def _request_payload(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
