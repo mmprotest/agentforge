@@ -4,6 +4,7 @@ AgentForge is a production-ready Python 3.11+ repository that implements an agen
 
 ## Features
 - OpenAI-compatible REST client (`/chat/completions`) with configurable base URL.
+- Deterministic controller that orchestrates microtasks, verification, and backtracking.
 - Built-in tools: HTTP fetch, workspace filesystem, Python sandbox, deep thinking planner, calculator, regex extract, unit conversion, JSON repair, multi-file code runner.
 - Tool registry and validation pipeline for safe tool creation.
 - CLI and FastAPI server.
@@ -22,6 +23,14 @@ pip install -e .[dev]
 ```bash
 python -m agentforge "Hello from mock mode"
 ```
+
+### Profiles (small-model friendly defaults)
+Profiles tune budgets, routing thresholds, and verification defaults:
+```bash
+python -m agentforge "Write a script" --profile code
+python -m agentforge "Solve 2+2" --profile math
+```
+Available profiles: `agent` (default), `code`, `math`, `qa`.
 
 ### Use an OpenAI-compatible base URL
 ```bash
@@ -77,7 +86,7 @@ Environment variables (CLI flags override env vars):
 
 Recommended small-model settings:
 ```bash
-python -m agentforge "Question" --self-consistency 2 --verify --summary-lines 8
+python -m agentforge "Question" --self-consistency 2 --verify --summary-lines 8 --profile qa
 ```
 
 Additional CLI flags for small-model robustness:
@@ -89,6 +98,14 @@ Strict JSON mode enforces a single JSON object response and retries once on form
 Context trimming keeps recent requests and tool summaries within a hard budget, which helps smaller
 local models stay focused. Single messages are hard-truncated to `MAX_SINGLE_MESSAGE_CHARS` before
 budget trimming. Sandbox execution now sanitizes environment variables by default.
+
+## Controller, microtasks, verification, backtracking
+AgentForge now runs a deterministic controller that breaks each query into a small microtask graph.
+The model proposes actions, but the controller decides when to route tools, verify outputs, and
+backtrack after repeated failures or stalled progress. Verification runs local checks such as
+schema validation, regex/predicate checks, tool recomputation, and code execution. Backtracking
+rewinds the microtask graph and adds a brief hint for a new approach, which makes runs more robust
+on smaller OpenAI-compatible models.
 
 ## Tool creation gating
 Tool creation is disabled by default. Enable it by setting `ALLOW_TOOL_CREATION=true` or using `--allow-tool-creation`. Generated tools are validated with AST-based checks and executed in a sandboxed test process before registration.

@@ -33,6 +33,7 @@ app = FastAPI()
 class RunRequest(BaseModel):
     query: str
     mode: str | None = None
+    profile: str | None = None
     allow_tool_creation: bool | None = None
     base_url: str | None = None
     model: str | None = None
@@ -98,6 +99,7 @@ async def run_agent(request: RunRequest) -> RunResponse:
         settings.openai_model = request.model
     if request.mode:
         settings.agent_mode = request.mode
+    profile = request.profile or "agent"
     if request.allow_tool_creation is not None:
         settings.allow_tool_creation = request.allow_tool_creation
     if request.summary_lines is not None:
@@ -144,6 +146,7 @@ async def run_agent(request: RunRequest) -> RunResponse:
         trim_strategy=settings.trim_strategy,
         code_check=settings.code_check,
         code_check_max_iters=settings.code_check_max_iters,
+        profile=profile,
     )
     result = agent.run(request.query)
     return RunResponse(

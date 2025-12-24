@@ -78,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-message-chars", type=int, dest="max_message_chars")
     parser.add_argument("--max-single-message-chars", type=int, dest="max_single_message_chars")
     parser.add_argument("--max-turns", type=int, dest="max_turns")
+    parser.add_argument("--profile", dest="profile", choices=["agent", "code", "math", "qa"])
     return parser.parse_args()
 
 
@@ -143,6 +144,7 @@ def main() -> None:
         trim_strategy=settings.trim_strategy,
         code_check=settings.code_check,
         code_check_max_iters=settings.code_check_max_iters,
+        profile=args.profile or "agent",
     )
     result = agent.run(args.query)
     print("Tools used:", ", ".join(result.tools_used) or "none")

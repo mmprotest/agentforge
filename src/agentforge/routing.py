@@ -34,7 +34,7 @@ def suggest_tool(routing_prompt: str) -> RouteSuggestion | None:
     if not normalized:
         return None
     user_query = _extract_user_query(normalized)
-    if _URL_RE.search(normalized):
+    if _URL_RE.search(user_query):
         url_match = _URL_RE.search(user_query)
         suggested_args = {"url": url_match.group(0)} if url_match else None
         return RouteSuggestion(
