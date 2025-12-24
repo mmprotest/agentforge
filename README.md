@@ -65,6 +65,8 @@ Environment variables (CLI flags override env vars):
 - `SUMMARY_LINES` (default `10`)
 - `MAX_MODEL_CALLS` (default `20`)
 - `MAX_MESSAGE_CHARS` (default `24000`)
+- `MAX_MESSAGE_TOKENS_APPROX` (default `6000`)
+- `TOKEN_CHAR_RATIO` (default `4`)
 - `MAX_TURNS` (default `20`)
 - `TRIM_STRATEGY` (default `drop_oldest`)
 - `STRICT_JSON_MODE` (default `false`)

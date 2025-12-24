@@ -117,6 +117,31 @@ def test_openai_base_url_without_v1():
 @pytest.mark.parametrize(
     ("base_url", "expected"),
     [
+        ("localhost:8000/v1", "http://localhost:8000/v1/chat/completions"),
+        ("127.0.0.1:8000", "http://127.0.0.1:8000/chat/completions"),
+    ],
+)
+def test_openai_base_url_missing_scheme(base_url: str, expected: str):
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    transport = httpx.MockTransport(handler)
+    client = OpenAICompatChatModel(
+        base_url=base_url,
+        api_key="test-key",
+        model="gpt-test",
+        transport=transport,
+    )
+    client.chat(messages=[{"role": "user", "content": "hi"}], tools=None)
+    assert requests[0].url == httpx.URL(expected)
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
         ("http://host:8000", "http://host:8000/v1/chat/completions"),
         ("http://host:8000/v1", "http://host:8000/v1/chat/completions"),
         ("http://host:8000/api/v1", "http://host:8000/api/v1/chat/completions"),

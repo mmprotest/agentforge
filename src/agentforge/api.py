@@ -134,6 +134,8 @@ async def run_agent(request: RunRequest) -> RunResponse:
         trace=trace,
         strict_json_mode=settings.strict_json_mode,
         max_message_chars=settings.max_message_chars,
+        max_message_tokens_approx=settings.max_message_tokens_approx,
+        token_char_ratio=settings.token_char_ratio,
         max_turns=settings.max_turns,
         trim_strategy=settings.trim_strategy,
         code_check=settings.code_check,

@@ -1,12 +1,13 @@
 import json
 
 from agentforge.agent import Agent
-from agentforge.models.base import BaseChatModel, ModelResponse
+from agentforge.models.base import BaseChatModel, ModelResponse, ToolCall
 from agentforge.models.mock import MockChatModel
 from agentforge.routing import suggest_tool
 from agentforge.safety.policy import SafetyPolicy
 from agentforge.tools.base import Tool, ToolResult
 from agentforge.tools.registry import ToolRegistry
+from pydantic import BaseModel
 
 
 def test_router_detects_url():
@@ -62,3 +63,64 @@ def test_router_direct_http_fetch_without_model_call(tmp_path):
     result = agent.run("Fetch https://example.com")
     assert "http_fetch" in result.tools_used
     assert model.calls == 0
+
+
+def test_router_hints_are_ephemeral():
+    class CaptureModel(BaseChatModel):
+        def __init__(self, scripted: list[ModelResponse]) -> None:
+            self.scripted = scripted
+            self.seen_messages: list[list[dict[str, object]]] = []
+
+        def chat(
+            self, messages: list[dict[str, object]], tools: list[dict[str, object]] | None
+        ) -> ModelResponse:
+            self.seen_messages.append(messages)
+            return self.scripted.pop(0)
+
+    class DummyInput(BaseModel):
+        value: int
+
+    class DummyTool(Tool):
+        name = "dummy"
+        description = "dummy tool"
+        input_schema = DummyInput
+
+        def run(self, data: BaseModel) -> ToolResult:
+            payload = DummyInput.model_validate(data)
+            return ToolResult(output={"ok": True, "value": payload.value})
+
+    scripted = [
+        ModelResponse(tool_call=ToolCall(name="dummy", arguments={})),
+        ModelResponse(
+            final_text='{"type":"final","answer":"done","confidence":0.2,"checks":[]}'
+        ),
+    ]
+    model = CaptureModel(scripted=scripted)
+    registry = ToolRegistry()
+    registry.register(DummyTool())
+    agent = Agent(
+        model=model,
+        registry=registry,
+        policy=SafetyPolicy(max_model_calls=5),
+    )
+    result = agent.run('Use regex /foo/ on "foo bar"')
+    assert "done" in result.answer
+    assert any(
+        "Router hint" in str(message.get("content"))
+        for call in model.seen_messages
+        for message in call
+        if message.get("role") == "user"
+    )
+    assert all(
+        "Router hint" not in str(message.get("content"))
+        for message in agent._messages
+    )
+
+
+def test_regex_extract_builder_prefers_slash_pattern_and_quoted_text():
+    agent = Agent(model=MockChatModel(), registry=ToolRegistry())
+    query = 'Extract /foo\\d+/ from "prefix foo123 suffix"'
+    args = agent._direct_tool_args("regex_extract", query, None)
+    assert args is not None
+    assert args["pattern"] == "foo\\d+"
+    assert args["text"] == "prefix foo123 suffix"

@@ -56,6 +56,8 @@ class Agent:
         trace: TraceRecorder | None = None,
         strict_json_mode: bool = False,
         max_message_chars: int = 24000,
+        max_message_tokens_approx: int = 6000,
+        token_char_ratio: int = 4,
         max_turns: int = 20,
         trim_strategy: str = "drop_oldest",
         code_check: bool = False,
@@ -72,6 +74,8 @@ class Agent:
         self.trace = trace
         self.strict_json_mode = strict_json_mode
         self.max_message_chars = max_message_chars
+        self.max_message_tokens_approx = max_message_tokens_approx
+        self.token_char_ratio = token_char_ratio
         self.max_turns = max_turns
         self.trim_strategy = trim_strategy
         self.code_check = code_check
@@ -113,7 +117,11 @@ class Agent:
         self._messages.append(message)
         if self.trim_strategy == "drop_oldest":
             self._messages = trim_messages(
-                self._messages, self.max_message_chars, self.max_turns
+                self._messages,
+                self.max_message_chars,
+                self.max_turns,
+                self.max_message_tokens_approx,
+                self.token_char_ratio,
             )
 
     def run(self, query: str) -> AgentResult:
@@ -173,6 +181,7 @@ class Agent:
 
         last_tool_summary: str | None = None
         last_parse_failed: str | None = None
+        retry_instruction: dict[str, Any] | None = None
         format_retry_remaining = 1 if self.strict_json_mode else 0
         code_check_enabled = self.code_check and is_code_task(query)
         for _ in range(self.policy.max_tool_calls):
@@ -193,24 +202,30 @@ class Agent:
                         suggestion.tool_name, output, None, direct_args
                     )
                     last_tool_summary = entry.summary
+                    self.memory.state["last_tool_summary"] = last_tool_summary
                     last_parse_failed = None
                     if ok is False:
+                        retry_instruction = self._build_retry_instruction(tool, output)
                         continue
                     continue
+            call_messages = list(self._messages)
             if suggestion and suggestion.confidence >= 0.6:
-                self._append_message(
+                call_messages.append(
                     {
-                        "role": "system",
+                        "role": "user",
                         "content": (
-                            "Router hint: consider using "
+                            "[Hint] Router hint: consider using "
                             f"{suggestion.tool_name} ({suggestion.reason})."
                         ),
                     }
                 )
+            if retry_instruction is not None:
+                call_messages.append(retry_instruction)
+                retry_instruction = None
             tools = self.registry.openai_schemas()
             if self._model_calls >= self.max_model_calls:
                 break
-            response = self.model.chat(self._messages, tools=tools)
+            response = self.model.chat(call_messages, tools=tools)
             self._model_calls += 1
             if self.trace:
                 tool_payload = (
@@ -295,8 +310,10 @@ class Agent:
                 tool_name, output, response.tool_call.id, response.tool_call.arguments
             )
             last_tool_summary = entry.summary
+            self.memory.state["last_tool_summary"] = last_tool_summary
             last_parse_failed = None
             if ok is False:
+                retry_instruction = self._build_retry_instruction(tool, output)
                 continue
         return AgentResult(
             answer="Reached tool call limit",
@@ -344,6 +361,11 @@ class Agent:
         last_parse_failed: str | None,
     ) -> dict[str, Any] | None:
         if tool_name == "calculator":
+            cue_match = re.search(r"(?:calc\s*:|=)\s*(.+)$", query, re.IGNORECASE)
+            if cue_match:
+                expression = cue_match.group(1).strip()
+                if expression:
+                    return {"expression": expression}
             matches = re.findall(r"[0-9\.\s\+\-\*\/\(\)]+", query)
             if matches:
                 expression = max(matches, key=len).strip()
@@ -365,9 +387,18 @@ class Agent:
             if pattern_match:
                 pattern = pattern_match.group(1)
             else:
-                pattern_match = re.search(r"pattern\s*[:=]\s*(\S+)", query, re.IGNORECASE)
-                pattern = pattern_match.group(1) if pattern_match else r".+"
-            return {"pattern": pattern, "text": query}
+                pattern_match = re.search(
+                    r"(?:pattern|regex)\s*:\s*(.+)$", query, re.IGNORECASE
+                )
+                pattern = pattern_match.group(1).strip() if pattern_match else r".+"
+            quoted = re.findall(r"(['\"])(.+?)\1", query, re.DOTALL)
+            if quoted:
+                text = max((segment for _, segment in quoted), key=len)
+            elif self.memory.state.get("last_tool_summary"):
+                text = str(self.memory.state["last_tool_summary"])
+            else:
+                text = query
+            return {"pattern": pattern, "text": text}
         if tool_name == "unit_convert":
             match = re.search(
                 r"convert\s+([0-9]*\.?[0-9]+)\s*([a-zA-Z]+)\s+to\s+([a-zA-Z]+)",
@@ -451,6 +482,60 @@ class Agent:
             "hint": "Fix arguments and retry",
         }
 
+    def _build_retry_instruction(
+        self, tool: Tool, output: Any
+    ) -> dict[str, Any]:
+        error_type = "ToolError"
+        error_message = "Unknown error"
+        if isinstance(output, dict):
+            error_type = str(output.get("error_type") or error_type)
+            error_message = str(output.get("error") or error_message)
+        error_message = error_message.strip()
+        if len(error_message) > 160:
+            error_message = f"{error_message[:157]}..."
+        schema = None
+        if getattr(tool, "input_schema", None) is not None:
+            schema = tool.input_schema.model_json_schema()
+        required_fields: list[str] = []
+        properties: dict[str, Any] = {}
+        if isinstance(schema, dict):
+            required_fields = list(schema.get("required") or [])
+            properties = schema.get("properties") or {}
+        example_args = {
+            field: self._example_value(properties.get(field, {}))
+            for field in required_fields
+        }
+        required_display = ", ".join(required_fields) if required_fields else "none"
+        example_call = {
+            "type": "tool",
+            "name": tool.name,
+            "arguments": example_args,
+        }
+        content = (
+            f"Tool error for '{tool.name}'.\n"
+            f"Error: {error_type}: {error_message}\n"
+            f"Required fields: {required_display}\n"
+            f"Example tool call JSON: {json.dumps(example_call)}\n"
+            "Return ONLY a tool call JSON object with corrected arguments."
+        )
+        return {"role": "user", "content": content}
+
+    def _example_value(self, schema: dict[str, Any]) -> Any:
+        schema_type = schema.get("type")
+        if schema_type == "string":
+            return "<value>"
+        if schema_type == "integer":
+            return 0
+        if schema_type == "number":
+            return 0.0
+        if schema_type == "boolean":
+            return False
+        if schema_type == "array":
+            return []
+        if schema_type == "object":
+            return {}
+        return "<value>"
+
     def _parse_model_protocol(
         self, content: str
     ) -> ProtocolToolCall | ProtocolFinal | None:
@@ -505,6 +590,9 @@ class Agent:
             if response.final_text:
                 protocol = self._parse_model_protocol(response.final_text)
                 if protocol is None and self.strict_json_mode:
+                    if self._extract_python_blocks(response.final_text):
+                        current_answer = response.final_text
+                        continue
                     return current_answer
                 if isinstance(protocol, ProtocolFinal):
                     current_answer = format_final(protocol.answer, protocol.checks)
