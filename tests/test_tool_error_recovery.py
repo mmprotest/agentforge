@@ -48,3 +48,37 @@ def test_tool_error_recovery_returns_final(tmp_path):
         event["type"] == "tool_result" and '"ok": false' in event["payload"]["summary"]
         for event in trace.events
     )
+
+
+def test_tool_error_recovery_includes_retry_instruction():
+    class CaptureModel(MockChatModel):
+        def __init__(self, scripted: list[ModelResponse]) -> None:
+            super().__init__(scripted=scripted)
+            self.seen_messages: list[list[dict[str, object]]] = []
+
+        def chat(
+            self, messages: list[dict[str, object]], tools: list[dict[str, object]] | None
+        ) -> ModelResponse:
+            self.seen_messages.append(messages)
+            return super().chat(messages, tools)
+
+    scripted = [
+        ModelResponse(tool_call=ToolCall(name="dummy", arguments={})),
+        ModelResponse(
+            final_text='{"type":"final","answer":"ok","confidence":0.2,"checks":[]}'
+        ),
+    ]
+    model = CaptureModel(scripted=scripted)
+    registry = ToolRegistry()
+    registry.register(DummyTool())
+    agent = Agent(model=model, registry=registry, policy=SafetyPolicy(max_model_calls=5))
+    result = agent.run("use dummy tool")
+    assert "ok" in result.answer
+    assert any(
+        "Return ONLY a tool call JSON object with corrected arguments."
+        in str(message.get("content"))
+        and "Required fields: value" in str(message.get("content"))
+        and '"name": "dummy"' in str(message.get("content"))
+        for call in model.seen_messages[1:]
+        for message in call
+    )

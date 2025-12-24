@@ -34,7 +34,11 @@ class OpenAICompatChatModel(BaseChatModel):
         force_chatcompletions_path: str | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
+        normalized = base_url.strip()
+        self._missing_scheme = not normalized.startswith(("http://", "https://"))
+        if self._missing_scheme:
+            normalized = f"http://{normalized}"
+        self.base_url = normalized.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.timeout_seconds = timeout_seconds
@@ -85,11 +89,13 @@ class OpenAICompatChatModel(BaseChatModel):
                 forced_path = f"/{forced_path}"
             return urlunparse(parsed._replace(path=forced_path, params="", query="", fragment=""))
         base_path = parsed.path.rstrip("/")
-        if base_path.endswith("/v1"):
+        if not base_path and self._missing_scheme:
+            root_path = ""
+        elif base_path.endswith("/v1"):
             root_path = base_path
         else:
             root_path = f"{base_path}/v1" if base_path else "/v1"
-        final_path = f"{root_path}/chat/completions"
+        final_path = f"{root_path}/chat/completions" if root_path else "/chat/completions"
         return urlunparse(parsed._replace(path=final_path, params="", query="", fragment=""))
 
     def _fallback_tool_call(self, content: str) -> ToolCall | None:

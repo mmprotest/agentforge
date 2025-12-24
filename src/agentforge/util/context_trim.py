@@ -28,14 +28,30 @@ def _truncate_tool_content(message: dict[str, Any], max_chars: int) -> dict[str,
     return message
 
 
+def _message_tokens(message: dict[str, Any], token_char_ratio: int) -> int:
+    content = message.get("content")
+    if content is None:
+        return 0
+    length = len(str(content))
+    if length == 0:
+        return 0
+    return max(1, length // token_char_ratio)
+
+
 def trim_messages(
-    messages: list[dict[str, Any]], max_chars: int, max_turns: int
+    messages: list[dict[str, Any]],
+    max_chars: int,
+    max_turns: int,
+    max_tokens_approx: int,
+    token_char_ratio: int,
 ) -> list[dict[str, Any]]:
-    """Trim messages to fit character and turn budgets."""
+    """Trim messages to fit character, turn, and token approximation budgets."""
     if not messages:
         return []
     max_chars = max(1, max_chars)
     max_turns = max(1, max_turns)
+    max_tokens_approx = max(1, max_tokens_approx)
+    token_char_ratio = max(1, token_char_ratio)
 
     trimmed = [dict(message) for message in messages]
     tool_max_chars = min(4000, max_chars)
@@ -60,7 +76,14 @@ def trim_messages(
         total_turns = sum(
             1 for item in items if item.get("role") in _TURN_ROLES
         )
-        return total_chars > max_chars or total_turns > max_turns
+        total_tokens = sum(
+            _message_tokens(item, token_char_ratio) for item in items
+        )
+        return (
+            total_chars > max_chars
+            or total_turns > max_turns
+            or total_tokens > max_tokens_approx
+        )
 
     removable_indices = [
         idx

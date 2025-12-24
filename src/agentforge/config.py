@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     summary_lines: int = Field(default=10, validation_alias="SUMMARY_LINES")
     max_model_calls: int = Field(default=20, validation_alias="MAX_MODEL_CALLS")
     max_message_chars: int = Field(default=24000, validation_alias="MAX_MESSAGE_CHARS")
+    max_message_tokens_approx: int = Field(
+        default=6000, validation_alias="MAX_MESSAGE_TOKENS_APPROX"
+    )
+    token_char_ratio: int = Field(default=4, validation_alias="TOKEN_CHAR_RATIO")
     max_turns: int = Field(default=20, validation_alias="MAX_TURNS")
     trim_strategy: Literal["drop_oldest"] = Field(
         default="drop_oldest", validation_alias="TRIM_STRATEGY"

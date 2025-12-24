@@ -61,3 +61,33 @@ result = Counter(["a", "a", "b"])
     )
     result = agent.run("write python code")
     assert "Counter" in result.answer
+
+
+def test_code_check_allows_non_json_reply_in_strict_mode(tmp_path):
+    buggy = """```python
+result = 1 / 0
+```"""
+    corrected = """```python
+result = 1 + 1
+```"""
+    buggy_payload = json.dumps(
+        {"type": "final", "answer": buggy, "confidence": 0.2, "checks": []}
+    )
+    model = MockChatModel(
+        scripted=[
+            ModelResponse(final_text=buggy_payload),
+            ModelResponse(final_text=corrected),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(PythonSandboxTool(str(tmp_path)))
+    agent = Agent(
+        model=model,
+        registry=registry,
+        policy=SafetyPolicy(max_model_calls=5),
+        code_check=True,
+        code_check_max_iters=2,
+        strict_json_mode=True,
+    )
+    result = agent.run("write code")
+    assert "1 + 1" in result.answer
