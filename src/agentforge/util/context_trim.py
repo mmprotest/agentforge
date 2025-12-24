@@ -6,6 +6,8 @@ from typing import Any
 
 
 _TURN_ROLES = {"user", "assistant", "tool"}
+_TRUNCATED_MARKER = "[TRUNCATED]"
+_ERROR_MARKERS = ("Traceback", "Error")
 
 
 def _message_length(message: dict[str, Any]) -> int:
@@ -28,6 +30,28 @@ def _truncate_tool_content(message: dict[str, Any], max_chars: int) -> dict[str,
     return message
 
 
+def _truncate_message_content(message: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    content = message.get("content")
+    if not isinstance(content, str):
+        return message
+    if len(content) <= max_chars:
+        return message
+    if max_chars <= len(_TRUNCATED_MARKER):
+        message["content"] = _TRUNCATED_MARKER[:max_chars]
+        return message
+    keep_tail = message.get("role") == "tool" and any(
+        marker in content for marker in _ERROR_MARKERS
+    )
+    keep_len = max_chars - len(_TRUNCATED_MARKER)
+    if keep_tail:
+        tail = content[-keep_len:]
+        message["content"] = f"{_TRUNCATED_MARKER}{tail}"
+    else:
+        head = content[:keep_len]
+        message["content"] = f"{head}{_TRUNCATED_MARKER}"
+    return message
+
+
 def _message_tokens(message: dict[str, Any], token_char_ratio: int) -> int:
     content = message.get("content")
     if content is None:
@@ -44,6 +68,7 @@ def trim_messages(
     max_turns: int,
     max_tokens_approx: int,
     token_char_ratio: int,
+    max_single_message_chars: int = 4000,
 ) -> list[dict[str, Any]]:
     """Trim messages to fit character, turn, and token approximation budgets."""
     if not messages:
@@ -52,8 +77,11 @@ def trim_messages(
     max_turns = max(1, max_turns)
     max_tokens_approx = max(1, max_tokens_approx)
     token_char_ratio = max(1, token_char_ratio)
+    max_single_message_chars = max(1, max_single_message_chars)
 
     trimmed = [dict(message) for message in messages]
+    for message in trimmed:
+        _truncate_message_content(message, max_single_message_chars)
     tool_max_chars = min(4000, max_chars)
     for message in trimmed:
         _truncate_tool_content(message, tool_max_chars)

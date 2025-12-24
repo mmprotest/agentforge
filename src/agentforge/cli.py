@@ -76,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--code-check", action="store_true", dest="code_check")
     parser.add_argument("--code-check-max-iters", type=int, dest="code_check_max_iters")
     parser.add_argument("--max-message-chars", type=int, dest="max_message_chars")
+    parser.add_argument("--max-single-message-chars", type=int, dest="max_single_message_chars")
     parser.add_argument("--max-turns", type=int, dest="max_turns")
     return parser.parse_args()
 
@@ -106,6 +107,8 @@ def apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
         data["code_check_max_iters"] = args.code_check_max_iters
     if args.max_message_chars:
         data["max_message_chars"] = args.max_message_chars
+    if args.max_single_message_chars:
+        data["max_single_message_chars"] = args.max_single_message_chars
     if args.max_turns:
         data["max_turns"] = args.max_turns
     return Settings(**data)
@@ -135,6 +138,7 @@ def main() -> None:
         max_message_chars=settings.max_message_chars,
         max_message_tokens_approx=settings.max_message_tokens_approx,
         token_char_ratio=settings.token_char_ratio,
+        max_single_message_chars=settings.max_single_message_chars,
         max_turns=settings.max_turns,
         trim_strategy=settings.trim_strategy,
         code_check=settings.code_check,
