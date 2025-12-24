@@ -64,7 +64,7 @@ def test_trim_messages_truncates_tool_tail_on_errors():
         max_single_message_chars=4000,
     )
     trimmed_content = trimmed[0]["content"]
-    assert trimmed_content.startswith("[TRUNCATED]")
+    assert trimmed_content.startswith("[TRUNCATED_HEAD]")
     assert "Traceback" in trimmed_content
     assert len(trimmed_content) <= 4000
 
@@ -81,6 +81,41 @@ def test_trim_messages_truncates_assistant_head():
         max_single_message_chars=4000,
     )
     trimmed_content = trimmed[0]["content"]
-    assert trimmed_content.endswith("[TRUNCATED]")
+    assert trimmed_content.endswith("[TRUNCATED_TAIL]")
     assert trimmed_content.startswith("hello ")
     assert len(trimmed_content) <= 4000
+
+
+def test_trim_messages_preserves_traceback_tail_during_budget_shrink():
+    tail_marker = "Traceback: failure\nLAST LINE"
+    content = "a" * 9500 + tail_marker
+    messages = [{"role": "tool", "content": content}]
+    trimmed = trim_messages(
+        messages,
+        max_chars=1500,
+        max_turns=5,
+        max_tokens_approx=5000,
+        token_char_ratio=4,
+        max_single_message_chars=4000,
+    )
+    trimmed_content = trimmed[0]["content"]
+    assert trimmed_content.startswith("[TRUNCATED_HEAD]")
+    assert tail_marker in trimmed_content
+    assert len(trimmed_content) <= 1500
+
+
+def test_trim_messages_preserves_head_for_non_error_budget_shrink():
+    content = "hello " * 2000
+    messages = [{"role": "assistant", "content": content}]
+    trimmed = trim_messages(
+        messages,
+        max_chars=1500,
+        max_turns=5,
+        max_tokens_approx=5000,
+        token_char_ratio=4,
+        max_single_message_chars=4000,
+    )
+    trimmed_content = trimmed[0]["content"]
+    assert trimmed_content.startswith("hello ")
+    assert trimmed_content.endswith("[TRUNCATED_TAIL]")
+    assert len(trimmed_content) <= 1500

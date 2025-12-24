@@ -6,8 +6,17 @@ from typing import Any
 
 
 _TURN_ROLES = {"user", "assistant", "tool"}
-_TRUNCATED_MARKER = "[TRUNCATED]"
-_ERROR_MARKERS = ("Traceback", "Error")
+_TRUNCATED_HEAD_MARKER = "[TRUNCATED_HEAD]"
+_TRUNCATED_TAIL_MARKER = "[TRUNCATED_TAIL]"
+_ERROR_MARKERS = (
+    "Traceback",
+    "Exception",
+    "Error:",
+    "AssertionError",
+    "KeyError",
+    "ValueError",
+    "TypeError",
+)
 
 
 def _message_length(message: dict[str, Any]) -> int:
@@ -17,17 +26,8 @@ def _message_length(message: dict[str, Any]) -> int:
     return len(str(content))
 
 
-def _truncate_tool_content(message: dict[str, Any], max_chars: int) -> dict[str, Any]:
-    if message.get("role") != "tool":
-        return message
-    content = message.get("content")
-    if not isinstance(content, str):
-        return message
-    if len(content) <= max_chars:
-        return message
-    trimmed = content[:max_chars].rstrip()
-    message["content"] = f"{trimmed}…(truncated)"
-    return message
+def _should_keep_tail(content: str) -> bool:
+    return any(marker in content for marker in _ERROR_MARKERS)
 
 
 def _truncate_message_content(message: dict[str, Any], max_chars: int) -> dict[str, Any]:
@@ -36,19 +36,18 @@ def _truncate_message_content(message: dict[str, Any], max_chars: int) -> dict[s
         return message
     if len(content) <= max_chars:
         return message
-    if max_chars <= len(_TRUNCATED_MARKER):
-        message["content"] = _TRUNCATED_MARKER[:max_chars]
+    keep_tail = _should_keep_tail(content)
+    marker = _TRUNCATED_HEAD_MARKER if keep_tail else _TRUNCATED_TAIL_MARKER
+    if max_chars <= len(marker):
+        message["content"] = marker[:max_chars]
         return message
-    keep_tail = message.get("role") == "tool" and any(
-        marker in content for marker in _ERROR_MARKERS
-    )
-    keep_len = max_chars - len(_TRUNCATED_MARKER)
+    keep_len = max_chars - len(marker)
     if keep_tail:
         tail = content[-keep_len:]
-        message["content"] = f"{_TRUNCATED_MARKER}{tail}"
+        message["content"] = f"{marker}{tail}"
     else:
         head = content[:keep_len]
-        message["content"] = f"{head}{_TRUNCATED_MARKER}"
+        message["content"] = f"{head}{marker}"
     return message
 
 
@@ -82,10 +81,6 @@ def trim_messages(
     trimmed = [dict(message) for message in messages]
     for message in trimmed:
         _truncate_message_content(message, max_single_message_chars)
-    tool_max_chars = min(4000, max_chars)
-    for message in trimmed:
-        _truncate_tool_content(message, tool_max_chars)
-
     last_user_index = None
     tool_indices: list[int] = []
     for idx, message in enumerate(trimmed):
@@ -118,7 +113,7 @@ def trim_messages(
         for idx, message in enumerate(trimmed)
         if message.get("role") in _TURN_ROLES and idx not in protected_indices
     ]
-    while over_budget(trimmed) and removable_indices:
+    while over_budget(trimmed) and removable_indices and len(trimmed) > 1:
         drop_index = removable_indices.pop(0)
         trimmed.pop(drop_index)
         removable_indices = [
@@ -127,5 +122,23 @@ def trim_messages(
         protected_indices = {
             idx - 1 if idx > drop_index else idx for idx in protected_indices
         }
+
+    if over_budget(trimmed):
+        max_chars_budget = min(max_chars, max_tokens_approx * token_char_ratio)
+        total_chars = sum(_message_length(item) for item in trimmed)
+        excess = total_chars - max_chars_budget
+        if excess > 0:
+            for message in trimmed:
+                content = message.get("content")
+                if not isinstance(content, str):
+                    continue
+                if excess <= 0:
+                    break
+                if len(content) <= 1:
+                    continue
+                reduction = min(excess, len(content) - 1)
+                new_max = len(content) - reduction
+                _truncate_message_content(message, new_max)
+                excess -= reduction
 
     return trimmed
