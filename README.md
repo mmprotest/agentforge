@@ -64,11 +64,27 @@ Environment variables (CLI flags override env vars):
 - `KEEP_RAW_TOOL_OUTPUT` (default `true`)
 - `SUMMARY_LINES` (default `10`)
 - `MAX_MODEL_CALLS` (default `20`)
+- `MAX_MESSAGE_CHARS` (default `24000`)
+- `MAX_TURNS` (default `20`)
+- `TRIM_STRATEGY` (default `drop_oldest`)
+- `STRICT_JSON_MODE` (default `false`)
+- `CODE_CHECK` (default `false`)
+- `CODE_CHECK_MAX_ITERS` (default `2`)
+- `SANDBOX_PASSTHROUGH_ENV` (comma-separated allowlist of extra env vars)
 
 Recommended small-model settings:
 ```bash
 python -m agentforge "Question" --self-consistency 2 --verify --summary-lines 8
 ```
+
+Additional CLI flags for small-model robustness:
+```bash
+python -m agentforge "Write code" --strict-json --code-check --max-message-chars 24000 --max-turns 20
+```
+
+Strict JSON mode enforces a single JSON object response and retries once on format errors.
+Context trimming keeps recent requests and tool summaries within a hard budget, which helps smaller
+local models stay focused. Sandbox execution now sanitizes environment variables by default.
 
 ## Tool creation gating
 Tool creation is disabled by default. Enable it by setting `ALLOW_TOOL_CREATION=true` or using `--allow-tool-creation`. Generated tools are validated with AST-based checks and executed in a sandboxed test process before registration.

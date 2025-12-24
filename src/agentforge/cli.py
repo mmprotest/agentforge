@@ -72,6 +72,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self-consistency", type=int, dest="self_consistency", default=1)
     parser.add_argument("--max-model-calls", type=int, dest="max_model_calls")
     parser.add_argument("--summary-lines", type=int, dest="summary_lines")
+    parser.add_argument("--strict-json", action="store_true", dest="strict_json")
+    parser.add_argument("--code-check", action="store_true", dest="code_check")
+    parser.add_argument("--code-check-max-iters", type=int, dest="code_check_max_iters")
+    parser.add_argument("--max-message-chars", type=int, dest="max_message_chars")
+    parser.add_argument("--max-turns", type=int, dest="max_turns")
     return parser.parse_args()
 
 
@@ -93,6 +98,16 @@ def apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
         data["summary_lines"] = args.summary_lines
     if args.max_model_calls:
         data["max_model_calls"] = args.max_model_calls
+    if args.strict_json:
+        data["strict_json_mode"] = True
+    if args.code_check:
+        data["code_check"] = True
+    if args.code_check_max_iters:
+        data["code_check_max_iters"] = args.code_check_max_iters
+    if args.max_message_chars:
+        data["max_message_chars"] = args.max_message_chars
+    if args.max_turns:
+        data["max_turns"] = args.max_turns
     return Settings(**data)
 
 
@@ -116,6 +131,12 @@ def main() -> None:
         self_consistency=args.self_consistency,
         max_model_calls=settings.max_model_calls,
         memory=memory,
+        strict_json_mode=settings.strict_json_mode,
+        max_message_chars=settings.max_message_chars,
+        max_turns=settings.max_turns,
+        trim_strategy=settings.trim_strategy,
+        code_check=settings.code_check,
+        code_check_max_iters=settings.code_check_max_iters,
     )
     result = agent.run(args.query)
     print("Tools used:", ", ".join(result.tools_used) or "none")

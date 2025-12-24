@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 
@@ -78,12 +78,19 @@ class OpenAICompatChatModel(BaseChatModel):
         return payload
 
     def _build_url(self) -> str:
+        parsed = urlparse(self.base_url)
         if self.force_chatcompletions_path:
-            return urljoin(f"{self.base_url}/", self.force_chatcompletions_path.lstrip("/"))
-        base = self.base_url.rstrip("/")
-        if base.endswith("/v1"):
-            return f"{base}/chat/completions"
-        return f"{base}/v1/chat/completions"
+            forced_path = self.force_chatcompletions_path
+            if not forced_path.startswith("/"):
+                forced_path = f"/{forced_path}"
+            return urlunparse(parsed._replace(path=forced_path, params="", query="", fragment=""))
+        base_path = parsed.path.rstrip("/")
+        if base_path.endswith("/v1"):
+            root_path = base_path
+        else:
+            root_path = f"{base_path}/v1" if base_path else "/v1"
+        final_path = f"{root_path}/chat/completions"
+        return urlunparse(parsed._replace(path=final_path, params="", query="", fragment=""))
 
     def _fallback_tool_call(self, content: str) -> ToolCall | None:
         protocol = parse_protocol(content)

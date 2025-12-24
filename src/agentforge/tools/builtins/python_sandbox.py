@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import builtins
 import multiprocessing
+import os
 import queue
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from agentforge.tools.base import Tool, ToolResult
+from agentforge.safety.sandbox import sanitize_env
 
 
 class PythonSandboxInput(BaseModel):
@@ -47,6 +49,9 @@ class PythonSandboxTool(Tool):
 
     def _run_code(self, code: str, output: multiprocessing.Queue) -> None:
         try:
+            sanitized = sanitize_env(os.environ.copy())
+            os.environ.clear()
+            os.environ.update(sanitized)
             self._validate_code(code)
             safe_builtins = {
                 "print": builtins.print,

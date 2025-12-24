@@ -19,6 +19,10 @@ _CONVERT_RE = re.compile(r"\bconvert\b|\bto\b", re.IGNORECASE)
 _JSON_RE = re.compile(r"\bjson\b|\bparse\b|\brepair\b", re.IGNORECASE)
 _REGEX_RE = re.compile(r"\bregex\b|\bextract\b", re.IGNORECASE)
 _CODE_RE = re.compile(r"\bpython\b|\bpytest\b|\bcode\b|\brun\b", re.IGNORECASE)
+_CODE_TASK_RE = re.compile(
+    r"\bwrite code\b|\bimplement\b|\bbug\b|\btests\b|\bleetcode\b|\bpython function\b|```",
+    re.IGNORECASE,
+)
 _FILE_RE = re.compile(r"\bfile\b|\bread\b|\bwrite\b", re.IGNORECASE)
 
 
@@ -41,3 +45,10 @@ def suggest_tool(query: str) -> RouteSuggestion | None:
     if _FILE_RE.search(normalized):
         return RouteSuggestion(tool_name="filesystem", confidence=0.6, reason="Filesystem operation requested")
     return None
+
+
+def is_code_task(query: str) -> bool:
+    normalized = query.strip()
+    if not normalized:
+        return False
+    return bool(_CODE_TASK_RE.search(normalized))

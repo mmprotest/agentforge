@@ -47,6 +47,19 @@ class Settings(BaseSettings):
     )
     summary_lines: int = Field(default=10, validation_alias="SUMMARY_LINES")
     max_model_calls: int = Field(default=20, validation_alias="MAX_MODEL_CALLS")
+    max_message_chars: int = Field(default=24000, validation_alias="MAX_MESSAGE_CHARS")
+    max_turns: int = Field(default=20, validation_alias="MAX_TURNS")
+    trim_strategy: Literal["drop_oldest"] = Field(
+        default="drop_oldest", validation_alias="TRIM_STRATEGY"
+    )
+    strict_json_mode: bool = Field(default=False, validation_alias="STRICT_JSON_MODE")
+    code_check: bool = Field(default=False, validation_alias="CODE_CHECK")
+    code_check_max_iters: int = Field(
+        default=2, validation_alias="CODE_CHECK_MAX_ITERS"
+    )
+    sandbox_passthrough_env: str | None = Field(
+        default=None, validation_alias="SANDBOX_PASSTHROUGH_ENV"
+    )
 
 
 DEFAULT_SETTINGS = Settings()
