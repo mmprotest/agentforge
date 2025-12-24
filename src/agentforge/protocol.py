@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any
 
 from agentforge.util.json_repair import JsonRepairError, repair_json
@@ -23,12 +24,21 @@ class ProtocolFinal:
 
 def parse_protocol(content: str) -> ProtocolToolCall | ProtocolFinal | None:
     """Parse a protocol object from model content."""
+    stripped = content.strip()
     try:
-        payload = repair_json(content)
-    except JsonRepairError:
-        return None
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        try:
+            payload = repair_json(content)
+        except JsonRepairError:
+            return None
     if not isinstance(payload, dict):
         return None
+    return protocol_from_payload(payload)
+
+
+def protocol_from_payload(payload: dict[str, Any]) -> ProtocolToolCall | ProtocolFinal | None:
+    """Parse protocol object from an already-decoded payload."""
     payload_type = payload.get("type")
     if payload_type == "tool":
         name = payload.get("name") or payload.get("tool")
@@ -46,7 +56,9 @@ def parse_protocol(content: str) -> ProtocolToolCall | ProtocolFinal | None:
             confidence = 0.0
         if not isinstance(checks, list):
             checks = []
-        return ProtocolFinal(answer=answer, confidence=float(confidence), checks=[str(c) for c in checks])
+        return ProtocolFinal(
+            answer=answer, confidence=float(confidence), checks=[str(c) for c in checks]
+        )
     if "name" in payload and "arguments" in payload:
         name = payload.get("name")
         arguments = payload.get("arguments")

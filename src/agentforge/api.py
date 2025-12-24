@@ -40,6 +40,11 @@ class RunRequest(BaseModel):
     self_consistency: int | None = None
     max_model_calls: int | None = None
     summary_lines: int | None = None
+    strict_json: bool | None = None
+    code_check: bool | None = None
+    code_check_max_iters: int | None = None
+    max_message_chars: int | None = None
+    max_turns: int | None = None
 
 
 class RunResponse(BaseModel):
@@ -98,6 +103,16 @@ async def run_agent(request: RunRequest) -> RunResponse:
         settings.summary_lines = request.summary_lines
     if request.max_model_calls is not None:
         settings.max_model_calls = request.max_model_calls
+    if request.strict_json is not None:
+        settings.strict_json_mode = request.strict_json
+    if request.code_check is not None:
+        settings.code_check = request.code_check
+    if request.code_check_max_iters is not None:
+        settings.code_check_max_iters = request.code_check_max_iters
+    if request.max_message_chars is not None:
+        settings.max_message_chars = request.max_message_chars
+    if request.max_turns is not None:
+        settings.max_turns = request.max_turns
     model = build_model(settings)
     registry = build_registry(settings, model)
     memory = MemoryStore(
@@ -117,6 +132,12 @@ async def run_agent(request: RunRequest) -> RunResponse:
         max_model_calls=settings.max_model_calls,
         memory=memory,
         trace=trace,
+        strict_json_mode=settings.strict_json_mode,
+        max_message_chars=settings.max_message_chars,
+        max_turns=settings.max_turns,
+        trim_strategy=settings.trim_strategy,
+        code_check=settings.code_check,
+        code_check_max_iters=settings.code_check_max_iters,
     )
     result = agent.run(request.query)
     return RunResponse(
