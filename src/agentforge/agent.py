@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+from agentforge.controller import ActionType, Controller
 from agentforge.models.base import BaseChatModel
 from agentforge.protocol import (
     ProtocolFinal,
@@ -20,14 +21,20 @@ from agentforge.protocol import (
     protocol_from_payload,
 )
 from agentforge.memory import MemoryEntry, MemoryStore
-from agentforge.routing import is_code_task, suggest_tool
+from agentforge.policy_engine import PolicyEngine
+from agentforge.profiles import get_profile
+from agentforge.routing import is_code_task
 from agentforge.safety.policy import SafetyPolicy
+from agentforge.state import AgentBudgets, AgentState
+from agentforge.tasks import MicroTask
 from agentforge.trace import TraceRecorder
 from agentforge.tools.base import Tool
 from agentforge.tools.builtins.deep_think import DeepThinkTool
 from agentforge.tools.registry import ToolRegistry
 from agentforge.util.context_trim import trim_messages
 from agentforge.util.json_repair import JsonRepairError, repair_json
+from agentforge.util.progress import ProgressTracker
+from agentforge.verifier import Verifier
 
 
 @dataclass
@@ -63,6 +70,7 @@ class Agent:
         trim_strategy: str = "drop_oldest",
         code_check: bool = False,
         code_check_max_iters: int = 2,
+        profile: str = "agent",
     ) -> None:
         self.model = model
         self.registry = registry
@@ -82,9 +90,11 @@ class Agent:
         self.trim_strategy = trim_strategy
         self.code_check = code_check
         self.code_check_max_iters = max(1, code_check_max_iters)
+        self.profile_name = profile
         self.tools_used: list[str] = []
         self.tools_created: list[str] = []
         self._model_calls = 0
+        self._last_state: AgentState | None = None
 
     def _internal_plan(self, query: str) -> None:
         if self.mode != "deep":
@@ -182,140 +192,278 @@ class Agent:
         if self.trace:
             self.trace.record_messages(self._messages)
 
-        last_tool_summary: str | None = None
+        profile = get_profile(self.profile_name)
+        policy_engine = PolicyEngine(profile)
+        controller = Controller(policy_engine)
+        verifier = Verifier(self._run_tool)
+        budgets = AgentBudgets(
+            model_calls=min(self.max_model_calls, profile.budgets.model_calls),
+            tool_calls=min(self.policy.max_tool_calls, profile.budgets.tool_calls),
+            backtracks=profile.budgets.backtracks,
+            verifies=profile.budgets.verifies,
+        )
+        code_check_enabled = self.code_check or (
+            profile.code_check_default and is_code_task(query)
+        )
+        state = AgentState(
+            query=query,
+            task_graph=None,
+            memory_state=self.memory.state,
+            last_tool_summary=None,
+            last_error=None,
+            progress=ProgressTracker(),
+            budgets=budgets,
+            profile=profile.name,
+            task_history=[],
+            routing_prompt="",
+        )
+        state.memory_state.update(
+            {
+                "candidate_output": None,
+                "candidate_source": None,
+                "candidate_checks": [],
+                "candidate_confidence": None,
+                "pending_verification": False,
+                "verifier_failures": {},
+                "tool_error_counts": {},
+                "backtrack_count": 0,
+                "draft_answer": None,
+                "final_answer": None,
+                "code_check_enabled": code_check_enabled,
+                "needs_revision": False,
+            }
+        )
         last_parse_failed: str | None = None
         retry_instruction: dict[str, Any] | None = None
         format_retry_message: dict[str, Any] | None = None
         format_retry_remaining = 1 if self.strict_json_mode else 0
-        code_check_enabled = self.code_check and is_code_task(query)
-        for _ in range(self.policy.max_tool_calls):
-            routing_prompt = self._build_router_prompt(
-                query, last_tool_summary, last_parse_failed
+        for _ in range(self.max_turns):
+            state.routing_prompt = self._build_router_prompt(
+                query, state.last_tool_summary, last_parse_failed
             )
-            suggestion = suggest_tool(routing_prompt)
-            direct_args = None
-            if suggestion:
-                direct_args = suggestion.suggested_args or self._direct_tool_args(
-                    suggestion.tool_name, query, last_parse_failed
-                )
-            if suggestion and suggestion.confidence >= 0.85 and direct_args is not None:
-                tool = self.registry.get(suggestion.tool_name)
-                if tool and self.policy.is_tool_allowed(suggestion.tool_name):
-                    output, ok = self._execute_tool(tool, direct_args)
-                    entry = self._handle_tool_result(
-                        suggestion.tool_name, output, None, direct_args
-                    )
-                    last_tool_summary = entry.summary
-                    self.memory.state["last_tool_summary"] = last_tool_summary
-                    last_parse_failed = None
-                    if ok is False:
-                        retry_instruction = self._build_retry_instruction(tool, output)
-                        continue
+            action = controller.decide(state)
+            if action.type == ActionType.ROUTE_TOOL:
+                if state.budgets.tool_calls <= 0:
+                    state.memory_state["pending_verification"] = True
                     continue
-            call_messages = list(self._messages)
-            if suggestion and suggestion.confidence >= 0.6:
-                call_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "[Hint] Router hint: consider using "
-                            f"{suggestion.tool_name} ({suggestion.reason})."
-                        ),
+                tool_name = action.tool_name or ""
+                direct_args = action.tool_args or self._direct_tool_args(
+                    tool_name, query, last_parse_failed
+                )
+                if direct_args is None:
+                    state.last_error = {
+                        "error": f"Missing arguments for tool {tool_name}",
+                        "suggested_fix": "Provide valid tool arguments.",
                     }
-                )
-            if retry_instruction is not None:
-                call_messages.append(retry_instruction)
-                retry_instruction = None
-            if format_retry_message is not None:
-                call_messages.append(format_retry_message)
-                format_retry_message = None
-            tools = self.registry.openai_schemas()
-            if self._model_calls >= self.max_model_calls:
-                break
-            response = self.model.chat(call_messages, tools=tools)
-            self._model_calls += 1
-            if self.trace:
-                tool_payload = (
-                    response.tool_call.model_dump()
-                    if response.tool_call is not None
-                    else None
-                )
-                self.trace.record_model_response(response.final_text, tool_payload)
-            protocol = None
-            if response.final_text:
-                protocol = self._parse_model_protocol(response.final_text)
-                if protocol is None and self.strict_json_mode:
-                    if format_retry_remaining > 0:
-                        format_retry_message = self._build_format_retry_message()
-                        format_retry_remaining -= 1
-                        last_parse_failed = response.final_text
-                        continue
-                    last_parse_failed = response.final_text
+                    state.memory_state["pending_verification"] = True
+                    continue
+                tool = self.registry.get(tool_name)
+                if tool is None:
                     return AgentResult(
-                        answer="Could not parse the model output as JSON.",
+                        answer=f"Requested unknown tool: {tool_name}",
                         tools_used=self.tools_used,
                         tools_created=self.tools_created,
                         trace_path=self._finalize_trace(),
                     )
-            if response.tool_call is None and isinstance(protocol, ProtocolToolCall):
-                response = response.model_copy(update={"tool_call": protocol_to_toolcall(protocol)})
-            if response.final_text is not None and isinstance(protocol, ProtocolFinal):
-                answer = format_final(protocol.answer, protocol.checks)
-                if code_check_enabled:
-                    answer = self._code_check_loop(answer)
-                return AgentResult(
-                    answer=answer,
-                    tools_used=self.tools_used,
-                    tools_created=self.tools_created,
-                    checks=protocol.checks,
-                    confidence=protocol.confidence,
-                    trace_path=self._finalize_trace(),
+                if not self.policy.is_tool_allowed(tool_name):
+                    return AgentResult(
+                        answer=f"Tool not allowed: {tool_name}",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
+                output, ok = self._execute_tool(tool, direct_args)
+                entry = self._handle_tool_result(
+                    tool_name, output, None, direct_args
                 )
-            if response.final_text is not None and response.tool_call is None:
-                answer = response.final_text
-                if code_check_enabled:
-                    answer = self._code_check_loop(answer)
-                return AgentResult(
-                    answer=answer,
-                    tools_used=self.tools_used,
-                    tools_created=self.tools_created,
-                    trace_path=self._finalize_trace(),
-                )
-            if response.tool_call is None:
-                return AgentResult(
-                    answer="No response from model",
-                    tools_used=self.tools_used,
-                    tools_created=self.tools_created,
-                    trace_path=self._finalize_trace(),
-                )
-            tool_name = response.tool_call.name
-            tool = self.registry.get(tool_name)
-            if tool is None:
-                return AgentResult(
-                    answer=f"Requested unknown tool: {tool_name}",
-                    tools_used=self.tools_used,
-                    tools_created=self.tools_created,
-                    trace_path=self._finalize_trace(),
-                )
-            if not self.policy.is_tool_allowed(tool_name):
-                return AgentResult(
-                    answer=f"Tool not allowed: {tool_name}",
-                    tools_used=self.tools_used,
-                    tools_created=self.tools_created,
-                    trace_path=self._finalize_trace(),
-                )
-            output, ok = self._execute_tool(tool, response.tool_call.arguments)
-            entry = self._handle_tool_result(
-                tool_name, output, response.tool_call.id, response.tool_call.arguments
-            )
-            last_tool_summary = entry.summary
-            self.memory.state["last_tool_summary"] = last_tool_summary
-            last_parse_failed = None
-            if ok is False:
-                retry_instruction = self._build_retry_instruction(tool, output)
+                state.budgets.tool_calls -= 1
+                state.last_tool_summary = entry.summary
+                self.memory.state["last_tool_summary"] = state.last_tool_summary
+                state.memory_state["candidate_output"] = output
+                state.memory_state["candidate_source"] = "tool"
+                state.memory_state["pending_verification"] = True
+                state.memory_state["last_tool_output"] = output
+                state.memory_state["last_tool_name"] = tool_name
+                state.memory_state["last_tool_args"] = direct_args
+                last_parse_failed = None
+                if not ok:
+                    self._record_tool_error(state, tool_name)
+                    retry_instruction = self._build_retry_instruction(tool, output)
                 continue
+            if action.type == ActionType.MODEL_TOOL:
+                if state.budgets.model_calls <= 0:
+                    state.memory_state["pending_verification"] = True
+                    continue
+                call_messages = list(self._messages)
+                if action.message_to_model:
+                    call_messages.append(
+                        {"role": "user", "content": action.message_to_model}
+                    )
+                if retry_instruction is not None:
+                    call_messages.append(retry_instruction)
+                    retry_instruction = None
+                if format_retry_message is not None:
+                    call_messages.append(format_retry_message)
+                    format_retry_message = None
+                tools = self.registry.openai_schemas()
+                response = self.model.chat(call_messages, tools=tools)
+                self._model_calls += 1
+                state.budgets.model_calls -= 1
+                if self.trace:
+                    tool_payload = (
+                        response.tool_call.model_dump()
+                        if response.tool_call is not None
+                        else None
+                    )
+                    self.trace.record_model_response(response.final_text, tool_payload)
+                protocol = None
+                if response.final_text:
+                    protocol = self._parse_model_protocol(response.final_text)
+                    if protocol is None and self.strict_json_mode:
+                        if code_check_enabled and self._extract_python_blocks(
+                            response.final_text
+                        ):
+                            state.memory_state["candidate_output"] = response.final_text
+                            state.memory_state["candidate_source"] = "model"
+                            state.memory_state["pending_verification"] = True
+                            last_parse_failed = None
+                            continue
+                        if format_retry_remaining > 0:
+                            format_retry_message = self._build_format_retry_message()
+                            format_retry_remaining -= 1
+                            last_parse_failed = response.final_text
+                            continue
+                        last_parse_failed = response.final_text
+                        return AgentResult(
+                            answer="Could not parse the model output as JSON.",
+                            tools_used=self.tools_used,
+                            tools_created=self.tools_created,
+                            trace_path=self._finalize_trace(),
+                        )
+                    if protocol is not None:
+                        last_parse_failed = None
+                if response.tool_call is None and isinstance(protocol, ProtocolToolCall):
+                    response = response.model_copy(
+                        update={"tool_call": protocol_to_toolcall(protocol)}
+                    )
+                current_task = state.task_graph.current_task
+                if response.final_text is not None and isinstance(protocol, ProtocolFinal):
+                    answer = format_final(protocol.answer, protocol.checks)
+                    if code_check_enabled:
+                        state.memory_state["draft_answer"] = answer
+                    state.memory_state["candidate_output"] = answer
+                    state.memory_state["candidate_source"] = "model"
+                    state.memory_state["candidate_checks"] = protocol.checks
+                    state.memory_state["candidate_confidence"] = protocol.confidence
+                    state.memory_state["pending_verification"] = True
+                    if current_task and current_task.goal.lower().startswith("final"):
+                        state.memory_state["final_answer"] = answer
+                    continue
+                if response.final_text is not None and response.tool_call is None:
+                    answer = response.final_text
+                    if code_check_enabled:
+                        state.memory_state["draft_answer"] = answer
+                    state.memory_state["candidate_output"] = answer
+                    state.memory_state["candidate_source"] = "model"
+                    state.memory_state["pending_verification"] = True
+                    if current_task and current_task.goal.lower().startswith("final"):
+                        state.memory_state["final_answer"] = answer
+                    continue
+                if response.tool_call is None:
+                    return AgentResult(
+                        answer="No response from model",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
+                tool_name = response.tool_call.name
+                tool = self.registry.get(tool_name)
+                if tool is None:
+                    return AgentResult(
+                        answer=f"Requested unknown tool: {tool_name}",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
+                if not self.policy.is_tool_allowed(tool_name):
+                    return AgentResult(
+                        answer=f"Tool not allowed: {tool_name}",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
+                output, ok = self._execute_tool(tool, response.tool_call.arguments)
+                entry = self._handle_tool_result(
+                    tool_name,
+                    output,
+                    response.tool_call.id,
+                    response.tool_call.arguments,
+                )
+                state.last_tool_summary = entry.summary
+                self.memory.state["last_tool_summary"] = state.last_tool_summary
+                state.memory_state["candidate_output"] = output
+                state.memory_state["last_tool_output"] = output
+                state.memory_state["last_tool_name"] = tool_name
+                state.memory_state["last_tool_args"] = response.tool_call.arguments
+                state.memory_state["candidate_source"] = "tool"
+                state.memory_state["pending_verification"] = True
+                if not ok:
+                    self._record_tool_error(state, tool_name)
+                    retry_instruction = self._build_retry_instruction(tool, output)
+                continue
+            if action.type == ActionType.VERIFY:
+                current_task = state.task_graph.current_task or state.task_graph.next_task()
+                if current_task is None:
+                    state.memory_state["pending_verification"] = False
+                    continue
+                candidate = state.memory_state.get("candidate_output")
+                if candidate is None and current_task.goal.lower().startswith("final"):
+                    candidate = state.memory_state.get("draft_answer")
+                if current_task.check.type == "code_run":
+                    source_key = current_task.inputs.get("source_key")
+                    if candidate is None and source_key:
+                        candidate = state.memory_state.get(source_key)
+                    if source_key:
+                        current_task = self._attach_code_source(current_task, candidate)
+                if current_task.check.type == "tool_recompute":
+                    current_task = self._attach_tool_recompute(current_task, state)
+                result = verifier.verify(candidate, current_task)
+                state.budgets.verifies -= 1
+                state.memory_state["pending_verification"] = False
+                self._record_verifier_result(state, current_task, result)
+                if result.ok:
+                    state.task_graph.mark_done(current_task.id)
+                    if current_task.goal.lower().startswith("draft"):
+                        state.memory_state["draft_answer"] = candidate
+                    if current_task.check.type == "code_run":
+                        state.memory_state["draft_answer"] = candidate
+                    if current_task.goal.lower().startswith("final"):
+                        state.memory_state["final_answer"] = candidate
+                else:
+                    state.task_graph.record_attempt(current_task.id)
+                self._update_progress(state, result)
+                continue
+            if action.type == ActionType.BACKTRACK:
+                self._apply_backtrack(state)
+                continue
+            if action.type == ActionType.FINAL:
+                answer = state.memory_state.get("final_answer") or state.memory_state.get("draft_answer")
+                if not answer and state.memory_state.get("candidate_output"):
+                    answer = state.memory_state["candidate_output"]
+                if not answer:
+                    answer = "No response from model"
+                self._last_state = state
+                return AgentResult(
+                    answer=str(answer),
+                    tools_used=self.tools_used,
+                    tools_created=self.tools_created,
+                    checks=state.memory_state.get("candidate_checks", []),
+                    confidence=state.memory_state.get("candidate_confidence"),
+                    trace_path=self._finalize_trace(),
+                )
+        self._last_state = state
         return AgentResult(
-            answer="Reached tool call limit",
+            answer="Reached iteration limit",
             tools_used=self.tools_used,
             tools_created=self.tools_created,
             trace_path=self._finalize_trace(),
@@ -352,6 +500,93 @@ class Agent:
                 self.trace.record_tool_call(tool_name, arguments)
             self.trace.record_tool_result(tool_name, entry.handle, entry.summary)
         return entry
+
+    def _run_tool(self, tool_name: str, arguments: dict[str, Any]) -> tuple[Any, bool]:
+        tool = self.registry.get(tool_name)
+        if tool is None:
+            return {"ok": False, "error": "tool not found"}, False
+        if not self.policy.is_tool_allowed(tool_name):
+            return {"ok": False, "error": "tool not allowed"}, False
+        return self._execute_tool(tool, arguments)
+
+    def _record_tool_error(self, state: AgentState, tool_name: str) -> None:
+        counts = state.memory_state.get("tool_error_counts", {})
+        counts[tool_name] = counts.get(tool_name, 0) + 1
+        state.memory_state["tool_error_counts"] = counts
+        state.last_error = {
+            "error": f"Tool error from {tool_name}",
+            "suggested_fix": "Adjust arguments or try an alternative tool.",
+        }
+
+    def _record_verifier_result(
+        self, state: AgentState, task: MicroTask, result: "VerifierResult"
+    ) -> None:
+        failures = state.memory_state.get("verifier_failures", {})
+        if not result.ok:
+            failures[task.id] = failures.get(task.id, 0) + 1
+            state.last_error = {
+                "error": "Verification failed",
+                "issues": result.issues,
+                "suggested_fix": result.suggested_fix
+                or "Revise the output to address verification issues.",
+            }
+            state.memory_state["needs_revision"] = True
+        else:
+            state.last_error = None
+            state.memory_state["needs_revision"] = False
+        state.memory_state["verifier_failures"] = failures
+        if self.trace:
+            self.trace.record(
+                "verifier",
+                {
+                    "task_id": task.id,
+                    "ok": result.ok,
+                    "issues": result.issues,
+                    "checks_run": result.checks_run,
+                },
+            )
+        state.task_history.append(state.task_graph.model_copy(deep=True))
+
+    def _update_progress(self, state: AgentState, result: "VerifierResult") -> None:
+        facts = state.memory_state.get("facts")
+        fact_count = len(facts) if isinstance(facts, list) else 0
+        tool_count = len(self.memory.entries)
+        issue_count = len(result.issues) if result else None
+        state.progress.update(fact_count, tool_count, result.ok, issue_count)
+
+    def _apply_backtrack(self, state: AgentState) -> None:
+        state.budgets.backtracks = max(0, state.budgets.backtracks - 1)
+        state.memory_state["backtrack_count"] = state.memory_state.get("backtrack_count", 0) + 1
+        if state.task_history:
+            state.task_graph = state.task_history.pop()
+        else:
+            current_task = state.task_graph.current_task or state.task_graph.next_task()
+            if current_task:
+                state.task_graph.mark_failed(current_task.id, notes="Backtracked")
+        state.last_error = {
+            "error": "Backtracked",
+            "suggested_fix": "Try a different approach or tool.",
+        }
+        state.memory_state["pending_verification"] = False
+        state.progress.reset()
+
+    def _attach_code_source(self, task: MicroTask, source: Any) -> MicroTask:
+        updated = task.model_copy(deep=True)
+        params = dict(updated.check.params)
+        params["source"] = source or ""
+        updated.check = updated.check.model_copy(update={"params": params})
+        return updated
+
+    def _attach_tool_recompute(self, task: MicroTask, state: AgentState) -> MicroTask:
+        updated = task.model_copy(deep=True)
+        params = dict(updated.check.params)
+        tool_name = state.memory_state.get("last_tool_name")
+        tool_args = state.memory_state.get("last_tool_args")
+        if tool_name and isinstance(tool_args, dict):
+            params.setdefault("tool_name", tool_name)
+            params.setdefault("tool_args", tool_args)
+        updated.check = updated.check.model_copy(update={"params": params})
+        return updated
 
     def _direct_tool_args(
         self,
