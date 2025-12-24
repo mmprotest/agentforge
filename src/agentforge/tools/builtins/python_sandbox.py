@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import importlib
 import multiprocessing
 import os
 import queue
@@ -31,6 +32,17 @@ class PythonSandboxTool(Tool):
     description = "Execute small Python snippets in a restricted sandbox."
     input_schema = PythonSandboxInput
 
+    _allowed_imports = {
+        "typing",
+        "math",
+        "re",
+        "collections",
+        "itertools",
+        "functools",
+        "statistics",
+        "dataclasses",
+    }
+
     def __init__(self, workspace_dir: str) -> None:
         self.workspace_dir = Path(workspace_dir).resolve()
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -39,7 +51,13 @@ class PythonSandboxTool(Tool):
         tree = ast.parse(code)
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
-                raise ValueError("Imports are not allowed in sandbox")
+                if isinstance(node, ast.ImportFrom) and node.level:
+                    raise ValueError("Relative imports are not allowed in sandbox")
+                base_module = node.module or ""
+                for alias in node.names:
+                    module = (base_module or alias.name).split(".")[0]
+                    if module not in self._allowed_imports:
+                        raise ValueError(f"Import not allowed in sandbox: {module}")
 
     def _safe_open(self, path: str, mode: str = "r"):
         target = (self.workspace_dir / path).resolve()
@@ -53,6 +71,21 @@ class PythonSandboxTool(Tool):
             os.environ.clear()
             os.environ.update(sanitized)
             self._validate_code(code)
+
+            def safe_import(
+                name: str,
+                globals_: dict[str, Any] | None = None,
+                locals_: dict[str, Any] | None = None,
+                fromlist: tuple[str, ...] = (),
+                level: int = 0,
+            ):
+                if level:
+                    raise ImportError("Relative imports are not allowed in sandbox")
+                base_name = name.split(".")[0]
+                if base_name not in self._allowed_imports:
+                    raise ImportError(f"Import not allowed in sandbox: {base_name}")
+                return importlib.import_module(name)
+
             safe_builtins = {
                 "print": builtins.print,
                 "len": builtins.len,
@@ -62,6 +95,7 @@ class PythonSandboxTool(Tool):
                 "max": builtins.max,
                 "sorted": builtins.sorted,
                 "open": self._safe_open,
+                "__import__": safe_import,
             }
             globals_dict = {"__builtins__": safe_builtins}
             locals_dict: dict[str, Any] = {}
