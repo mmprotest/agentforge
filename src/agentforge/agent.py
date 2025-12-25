@@ -726,7 +726,7 @@ class Agent:
             constraints = state.memory_state.setdefault("constraints", {})
             if isinstance(constraints, dict):
                 constraints["verifier_failures"] = failure_payload
-        if state.memory_state.get("candidate_source") == "tool":
+        if not result.passed and state.memory_state.get("candidate_source") == "tool":
             tool_name = state.memory_state.get("last_tool_name") or "tool"
             penalties = state.memory_state.get("route_penalties", {})
             penalties[tool_name] = penalties.get(tool_name, 0) + 1
@@ -738,7 +738,7 @@ class Agent:
                     reason="Tool output failed verification",
                     details={"tool_name": tool_name},
                 )
-                )
+            )
             for failure in result.failures:
                 self._record_failure(
                     FailureEvent(
@@ -746,7 +746,7 @@ class Agent:
                         reason=failure.reason,
                     )
                 )
-        else:
+        if result.passed:
             state.last_error = None
             state.memory_state["needs_revision"] = False
             constraints = state.memory_state.get("constraints")
@@ -826,6 +826,8 @@ class Agent:
     def _is_forced_tool_task(self, task: MicroTask) -> bool:
         tool_hint = (task.tool_hint or "").strip()
         if not tool_hint or tool_hint.lower() == "router":
+            return False
+        if self._check_includes_type(task.check, "code_run"):
             return False
         return self.registry.get(tool_hint) is not None
 
@@ -1337,8 +1339,14 @@ class Agent:
         parts = parts[:-1] + [json.dumps(payload, ensure_ascii=False)]
         trimmed = "\n".join(parts)
         if len(trimmed) > 1200:
+            retry_parts = [
+                part
+                for part in parts
+                if part.startswith("- Tool retry:") or part.startswith("- Format retry:")
+            ]
             minimal_parts = [
                 "Microtask contract:",
+                *retry_parts,
                 "CONTRACT_JSON:",
                 json.dumps(payload, ensure_ascii=False),
             ]
