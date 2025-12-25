@@ -26,12 +26,13 @@ from agentforge.profiles import get_profile
 from agentforge.routing import is_code_task
 from agentforge.safety.policy import SafetyPolicy
 from agentforge.state import AgentBudgets, AgentState
-from agentforge.tasks import MicroTask
+from agentforge.tasks import CheckSpec, MicroTask
 from agentforge.trace import TraceRecorder
 from agentforge.tools.base import Tool
 from agentforge.tools.builtins.deep_think import DeepThinkTool
 from agentforge.tools.registry import ToolRegistry
 from agentforge.util.context_trim import trim_messages
+from agentforge.util.fact_extract import extract_facts
 from agentforge.util.json_repair import JsonRepairError, repair_json
 from agentforge.util.progress import ProgressTracker
 from agentforge.verifier import Verifier
@@ -56,21 +57,21 @@ class Agent:
         registry: ToolRegistry,
         policy: SafetyPolicy | None = None,
         mode: str = "direct",
-        verify: bool = False,
+        verify: bool | None = None,
         self_consistency: int = 1,
         max_model_calls: int | None = None,
         memory: MemoryStore | None = None,
         trace: TraceRecorder | None = None,
-        strict_json_mode: bool = False,
+        strict_json_mode: bool | None = None,
         max_message_chars: int = 24000,
         max_message_tokens_approx: int = 6000,
         token_char_ratio: int = 4,
         max_single_message_chars: int = 4000,
         max_turns: int = 20,
         trim_strategy: str = "drop_oldest",
-        code_check: bool = False,
-        code_check_max_iters: int = 2,
-        profile: str = "agent",
+        code_check: bool | None = None,
+        code_check_max_iters: int | None = None,
+        profile: str | None = None,
     ) -> None:
         self.model = model
         self.registry = registry
@@ -89,8 +90,9 @@ class Agent:
         self.max_turns = max_turns
         self.trim_strategy = trim_strategy
         self.code_check = code_check
-        self.code_check_max_iters = max(1, code_check_max_iters)
-        self.profile_name = profile
+        self.code_check_max_iters = code_check_max_iters
+        self.profile_name = profile or "agent"
+        self.profile_explicit = profile is not None
         self.tools_used: list[str] = []
         self.tools_created: list[str] = []
         self._model_calls = 0
@@ -138,6 +140,8 @@ class Agent:
             )
 
     def run(self, query: str) -> AgentResult:
+        profile = get_profile(self.profile_name)
+        verify_enabled = profile.verify_default if self.verify is None else self.verify
         if self.self_consistency > 1:
             candidates: list[AgentResult] = []
             for index in range(self.self_consistency):
@@ -149,14 +153,14 @@ class Agent:
             if not candidates:
                 return AgentResult(answer="No response from model")
             best = self._pick_best(candidates)
-            if self.verify and self._model_calls < self.max_model_calls:
+            if verify_enabled and self._model_calls < self.max_model_calls:
                 verified = self._verify_answer(query, best.answer)
                 best.answer = verified.answer
                 best.checks = verified.checks
                 best.confidence = verified.confidence
             return best
         result = self._run_once(query)
-        if self.verify and self._model_calls < self.max_model_calls:
+        if verify_enabled and self._model_calls < self.max_model_calls:
             verified = self._verify_answer(query, result.answer)
             result.answer = verified.answer
             result.checks = verified.checks
@@ -172,6 +176,15 @@ class Agent:
             summary_lines=self.memory.summary_lines,
         )
         self._messages = []
+        profile = get_profile(self.profile_name)
+        strict_json_mode = profile.strict_json_default if self.strict_json_mode is None else self.strict_json_mode
+        self.strict_json_mode = strict_json_mode
+        effective_code_check_max_iters = (
+            profile.code_check_max_iters_default
+            if self.code_check_max_iters is None
+            else max(1, self.code_check_max_iters)
+        )
+        self.code_check_max_iters = effective_code_check_max_iters
         system_prompt = (
             "You are an agent that can use tools. "
             "Use tools when necessary. "
@@ -180,7 +193,7 @@ class Agent:
             'or {"type":"final","answer":"...","confidence":0.0,"checks":[...]} '
             "Do not reveal chain-of-thought."
         )
-        if self.strict_json_mode:
+        if strict_json_mode:
             system_prompt += (
                 " Output must be exactly one JSON object and nothing else."
             )
@@ -192,7 +205,6 @@ class Agent:
         if self.trace:
             self.trace.record_messages(self._messages)
 
-        profile = get_profile(self.profile_name)
         policy_engine = PolicyEngine(profile)
         controller = Controller(policy_engine)
         verifier = Verifier(self._run_tool)
@@ -202,7 +214,12 @@ class Agent:
             backtracks=profile.budgets.backtracks,
             verifies=profile.budgets.verifies,
         )
-        code_check_enabled = self.code_check or (
+        base_code_check = (
+            profile.code_check_default
+            if self.code_check is None
+            else bool(self.code_check)
+        )
+        code_check_enabled = base_code_check or (
             profile.code_check_default and is_code_task(query)
         )
         state = AgentState(
@@ -216,6 +233,9 @@ class Agent:
             profile=profile.name,
             task_history=[],
             routing_prompt="",
+            snapshots=[],
+            last_snapshot_task_id=None,
+            profile_explicit=self.profile_explicit,
         )
         state.memory_state.update(
             {
@@ -231,6 +251,9 @@ class Agent:
                 "final_answer": None,
                 "code_check_enabled": code_check_enabled,
                 "needs_revision": False,
+                "tool_handles": [],
+                "tool_handle_count": 0,
+                "last_tool_facts": [],
             }
         )
         last_parse_failed: str | None = None
@@ -295,16 +318,17 @@ class Agent:
                     state.memory_state["pending_verification"] = True
                     continue
                 call_messages = list(self._messages)
-                if action.message_to_model:
-                    call_messages.append(
-                        {"role": "user", "content": action.message_to_model}
-                    )
-                if retry_instruction is not None:
-                    call_messages.append(retry_instruction)
-                    retry_instruction = None
-                if format_retry_message is not None:
-                    call_messages.append(format_retry_message)
-                    format_retry_message = None
+                contract_message = self._build_contract_message(
+                    state,
+                    hint=action.message_to_model,
+                    retry_instruction=retry_instruction,
+                    format_retry_message=format_retry_message,
+                    strict_json_mode=strict_json_mode,
+                )
+                if contract_message:
+                    call_messages.append(contract_message)
+                retry_instruction = None
+                format_retry_message = None
                 tools = self.registry.openai_schemas()
                 response = self.model.chat(call_messages, tools=tools)
                 self._model_calls += 1
@@ -319,7 +343,7 @@ class Agent:
                 protocol = None
                 if response.final_text:
                     protocol = self._parse_model_protocol(response.final_text)
-                    if protocol is None and self.strict_json_mode:
+                    if protocol is None and strict_json_mode:
                         if code_check_enabled and self._extract_python_blocks(
                             response.final_text
                         ):
@@ -419,15 +443,19 @@ class Agent:
                 candidate = state.memory_state.get("candidate_output")
                 if candidate is None and current_task.goal.lower().startswith("final"):
                     candidate = state.memory_state.get("draft_answer")
+                candidate_for_check = self._coerce_candidate_for_check(
+                    current_task, candidate
+                )
                 if current_task.check.type == "code_run":
                     source_key = current_task.inputs.get("source_key")
                     if candidate is None and source_key:
                         candidate = state.memory_state.get(source_key)
                     if source_key:
                         current_task = self._attach_code_source(current_task, candidate)
+                current_task = self._attach_tool_error_absent(current_task, state)
                 if current_task.check.type == "tool_recompute":
                     current_task = self._attach_tool_recompute(current_task, state)
-                result = verifier.verify(candidate, current_task)
+                result = verifier.verify(candidate_for_check, current_task)
                 state.budgets.verifies -= 1
                 state.memory_state["pending_verification"] = False
                 self._record_verifier_result(state, current_task, result)
@@ -444,7 +472,7 @@ class Agent:
                 self._update_progress(state, result)
                 continue
             if action.type == ActionType.BACKTRACK:
-                self._apply_backtrack(state)
+                self._apply_backtrack(state, action.reason)
                 continue
             if action.type == ActionType.FINAL:
                 answer = state.memory_state.get("final_answer") or state.memory_state.get("draft_answer")
@@ -483,6 +511,9 @@ class Agent:
             if tool_created:
                 self.tools_created.append(tool_created)
         entry = self.memory.add_tool_output(tool_name, output)
+        self._update_facts_from_tool(tool_name, output, entry.summary)
+        self.memory.state["tool_handles"] = [item.handle for item in self.memory.entries]
+        self.memory.state["tool_handle_count"] = len(self.memory.entries)
         is_error_payload = isinstance(output, dict) and output.get("ok") is False
         content = (
             json.dumps(output)
@@ -545,19 +576,56 @@ class Agent:
                     "checks_run": result.checks_run,
                 },
             )
+            if state.last_error and state.last_error.get("issues"):
+                self.trace.record(
+                    "verifier_issues",
+                    {"task_id": task.id, "issues": state.last_error["issues"][:3]},
+                )
         state.task_history.append(state.task_graph.model_copy(deep=True))
 
     def _update_progress(self, state: AgentState, result: "VerifierResult") -> None:
         facts = state.memory_state.get("facts")
         fact_count = len(facts) if isinstance(facts, list) else 0
+        fact_signature = "|".join(facts) if isinstance(facts, list) else ""
         tool_count = len(self.memory.entries)
         issue_count = len(result.issues) if result else None
-        state.progress.update(fact_count, tool_count, result.ok, issue_count)
+        state.progress.update(
+            fact_count, tool_count, result.ok, issue_count, fact_signature=fact_signature
+        )
 
-    def _apply_backtrack(self, state: AgentState) -> None:
+    def _apply_backtrack(self, state: AgentState, reason: str) -> None:
         state.budgets.backtracks = max(0, state.budgets.backtracks - 1)
         state.memory_state["backtrack_count"] = state.memory_state.get("backtrack_count", 0) + 1
-        if state.task_history:
+        snapshot = state.snapshots.pop() if state.snapshots else None
+        if snapshot:
+            state.task_graph = snapshot.task_graph.model_copy(deep=True)
+            for key, value in snapshot.memory_state_subset.items():
+                state.memory_state[key] = value
+            state.memory_state["tool_error_counts"] = snapshot.tool_error_counts
+            state.memory_state["verifier_failures"] = snapshot.verifier_failures
+            state.last_tool_summary = snapshot.last_tool_summary
+            state.last_error = snapshot.last_error
+            state.progress = ProgressTracker.from_dict(snapshot.progress_state)
+            handle_count = snapshot.tool_handle_count
+            if handle_count:
+                self.memory.entries = self.memory.entries[:handle_count]
+                handles = set(snapshot.tool_handles)
+                if handles:
+                    self.memory.raw_outputs = {
+                        key: value
+                        for key, value in self.memory.raw_outputs.items()
+                        if key in handles
+                    }
+            else:
+                self.memory.entries = []
+                self.memory.raw_outputs = {}
+            if self.trace:
+                self.trace.record(
+                    "snapshot_restore",
+                    {"task_id": state.task_graph.current_task_id, "handles": handle_count},
+                )
+            state.last_snapshot_task_id = state.task_graph.current_task_id
+        elif state.task_history:
             state.task_graph = state.task_history.pop()
         else:
             current_task = state.task_graph.current_task or state.task_graph.next_task()
@@ -569,6 +637,11 @@ class Agent:
         }
         state.memory_state["pending_verification"] = False
         state.progress.reset()
+        if self.trace:
+            self.trace.record(
+                "backtrack",
+                {"reason": reason, "task_id": state.task_graph.current_task_id},
+            )
 
     def _attach_code_source(self, task: MicroTask, source: Any) -> MicroTask:
         updated = task.model_copy(deep=True)
@@ -586,6 +659,29 @@ class Agent:
             params.setdefault("tool_name", tool_name)
             params.setdefault("tool_args", tool_args)
         updated.check = updated.check.model_copy(update={"params": params})
+        return updated
+
+    def _attach_tool_error_absent(self, task: MicroTask, state: AgentState) -> MicroTask:
+        if not self._check_includes_type(task.check, "tool_error_absent"):
+            return task
+
+        def attach(check: "CheckSpec") -> "CheckSpec":
+            if check.type == "tool_error_absent":
+                params = dict(check.params)
+                params["tool_output"] = state.memory_state.get("last_tool_output")
+                return check.model_copy(update={"params": params})
+            if check.all_of:
+                return check.model_copy(
+                    update={"all_of": [attach(sub) for sub in check.all_of]}
+                )
+            if check.any_of:
+                return check.model_copy(
+                    update={"any_of": [attach(sub) for sub in check.any_of]}
+                )
+            return check
+
+        updated = task.model_copy(deep=True)
+        updated.check = attach(updated.check)
         return updated
 
     def _direct_tool_args(
@@ -646,6 +742,114 @@ class Agent:
                     "to_unit": match.group(3),
                 }
         return None
+
+    def _build_contract_message(
+        self,
+        state: AgentState,
+        hint: str | None,
+        retry_instruction: dict[str, Any] | None,
+        format_retry_message: dict[str, Any] | None,
+        strict_json_mode: bool,
+    ) -> dict[str, Any] | None:
+        current_task = state.task_graph.current_task
+        if current_task is None:
+            return None
+        parts: list[str] = []
+        parts.append("Microtask contract:")
+        parts.append(f"- Goal: {current_task.goal}")
+        criteria = self._describe_check(current_task.check)
+        if criteria:
+            parts.append(f"- Success: {criteria}")
+        if current_task.tool_hint:
+            parts.append(f"- Tool hint: {current_task.tool_hint}")
+        if state.last_error and state.last_error.get("issues"):
+            issues = state.last_error.get("issues") or []
+            top_issues = "; ".join(str(issue) for issue in issues[:3])
+            suggested = state.last_error.get("suggested_fix")
+            if suggested:
+                parts.append(f"- Fix issues: {top_issues} | Change: {suggested}")
+            else:
+                parts.append(f"- Fix issues: {top_issues}")
+        if strict_json_mode:
+            parts.append("- Output: single JSON object only")
+        if hint:
+            parts.append(f"- Hint: {hint}")
+        if retry_instruction and retry_instruction.get("content"):
+            parts.append(f"- Tool retry: {retry_instruction['content']}")
+        if format_retry_message and format_retry_message.get("content"):
+            parts.append(f"- Format retry: {format_retry_message['content']}")
+        content = "\n".join(parts)
+        if len(content) > 800:
+            content = content[:797] + "..."
+        return {"role": "user", "content": content}
+
+    def _describe_check(self, check: "CheckSpec") -> str:
+        if check.all_of:
+            return " AND ".join(self._describe_check(sub) for sub in check.all_of)
+        if check.any_of:
+            return " OR ".join(self._describe_check(sub) for sub in check.any_of)
+        if check.type == "contains_fields":
+            fields = check.params.get("required_fields") or []
+            return f"include fields: {', '.join(fields) or 'unspecified'}"
+        if check.type == "json_protocol":
+            keys = check.params.get("required_keys") or ["answer"]
+            return f"valid JSON with keys: {', '.join(keys)}"
+        if check.type == "regex":
+            pattern = check.params.get("pattern") or ""
+            return f"match /{pattern}/" if pattern else "match required pattern"
+        if check.type == "predicate":
+            name = check.params.get("name") or "non_empty"
+            return f"predicate: {name}"
+        if check.type == "tool_recompute":
+            return "match tool recompute output"
+        if check.type == "tool_error_absent":
+            return "no tool errors"
+        if check.type == "code_run":
+            return "code runs without errors"
+        if check.type == "schema":
+            return "match required schema"
+        return "satisfy check"
+
+    def _check_includes_type(self, check: "CheckSpec", check_type: str) -> bool:
+        if check.type == check_type:
+            return True
+        if check.all_of and any(
+            self._check_includes_type(sub, check_type) for sub in check.all_of
+        ):
+            return True
+        if check.any_of and any(
+            self._check_includes_type(sub, check_type) for sub in check.any_of
+        ):
+            return True
+        return False
+
+    def _coerce_candidate_for_check(self, task: MicroTask, candidate: Any) -> Any:
+        if candidate is None:
+            return candidate
+        if task.goal.lower().startswith("final") and self._check_includes_type(
+            task.check, "contains_fields"
+        ):
+            if not isinstance(candidate, dict):
+                return {"answer": str(candidate)}
+        return candidate
+
+    def _update_facts_from_tool(
+        self, tool_name: str, output: Any, summary_text: str
+    ) -> None:
+        facts = extract_facts(tool_name, output, summary_text)
+        if not facts:
+            self.memory.state["last_tool_facts"] = []
+            return
+        fact_store = self.memory.state.setdefault("facts", [])
+        if not isinstance(fact_store, list):
+            fact_store = []
+            self.memory.state["facts"] = fact_store
+        existing = set(fact_store)
+        for fact in facts:
+            if fact not in existing:
+                fact_store.append(fact)
+                existing.add(fact)
+        self.memory.state["last_tool_facts"] = facts
 
     def _pick_best(self, candidates: list[AgentResult]) -> AgentResult:
         def score(candidate: AgentResult) -> tuple[float, int, int]:

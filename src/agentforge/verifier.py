@@ -27,14 +27,49 @@ class Verifier:
     def verify(
         self, candidate_output: Any, task: MicroTask
     ) -> VerifierResult:
+        issues, checks_run = self._evaluate_check(task.check, candidate_output, task)
+        ok = not issues
+        suggested_fix = None
+        if not ok:
+            suggested_fix = task.check.params.get("suggested_fix")
+        return VerifierResult(
+            ok=ok,
+            issues=issues,
+            checks_run=checks_run,
+            suggested_fix=suggested_fix,
+        )
+
+    def _evaluate_check(
+        self, check: CheckSpec, candidate_output: Any, task: MicroTask
+    ) -> tuple[list[str], list[str]]:
         checks_run: list[str] = []
         issues: list[str] = []
-        check = task.check
-        if isinstance(candidate_output, dict) and candidate_output.get("ok") is False:
-            issues.append("Tool error payload received")
-            return VerifierResult(ok=False, issues=issues, checks_run=["tool_error"])
+        if check.all_of:
+            checks_run.append("all_of")
+            for subcheck in check.all_of:
+                sub_issues, sub_checks = self._evaluate_check(
+                    subcheck, candidate_output, task
+                )
+                checks_run.extend(sub_checks)
+                issues.extend(sub_issues)
+            return issues, checks_run
+        if check.any_of:
+            checks_run.append("any_of")
+            any_ok = False
+            aggregated: list[str] = []
+            for subcheck in check.any_of:
+                sub_issues, sub_checks = self._evaluate_check(
+                    subcheck, candidate_output, task
+                )
+                checks_run.extend(sub_checks)
+                if not sub_issues:
+                    any_ok = True
+                aggregated.extend(sub_issues)
+            if any_ok:
+                return [], checks_run
+            return aggregated, checks_run
         if check.type == "none":
-            return VerifierResult(ok=True, issues=[], checks_run=["none"])
+            return [], ["none"]
         if check.type == "schema":
             checks_run.append("schema")
             payload = self._load_json(candidate_output)
@@ -53,6 +88,31 @@ class Verifier:
         elif check.type == "predicate":
             checks_run.append("predicate")
             issues.extend(self._run_predicate(check, candidate_output))
+        elif check.type == "contains_fields":
+            checks_run.append("contains_fields")
+            fields = check.params.get("required_fields") or []
+            payload = self._load_json(candidate_output)
+            if not isinstance(payload, dict):
+                issues.append("Output is not a JSON object")
+            else:
+                for field in fields:
+                    if field not in payload:
+                        issues.append(f"Missing field '{field}'")
+        elif check.type == "json_protocol":
+            checks_run.append("json_protocol")
+            required_keys = check.params.get("required_keys") or ["answer"]
+            payload = self._load_json(candidate_output)
+            if not isinstance(payload, dict):
+                issues.append("Output is not a JSON object")
+            else:
+                for field in required_keys:
+                    if field not in payload:
+                        issues.append(f"Missing protocol key '{field}'")
+        elif check.type == "tool_error_absent":
+            checks_run.append("tool_error_absent")
+            tool_output = check.params.get("tool_output", candidate_output)
+            if isinstance(tool_output, dict) and tool_output.get("ok") is False:
+                issues.append("Tool output indicates failure")
         elif check.type == "tool_recompute":
             checks_run.append("tool_recompute")
             issues.extend(self._run_tool_recompute(check, candidate_output))
@@ -61,16 +121,7 @@ class Verifier:
             issues.extend(self._run_code_check(check, candidate_output))
         else:
             issues.append(f"Unknown check type: {check.type}")
-        ok = not issues
-        suggested_fix = None
-        if not ok:
-            suggested_fix = check.params.get("suggested_fix")
-        return VerifierResult(
-            ok=ok,
-            issues=issues,
-            checks_run=checks_run,
-            suggested_fix=suggested_fix,
-        )
+        return issues, checks_run
 
     def _load_json(self, candidate_output: Any) -> Any | None:
         if isinstance(candidate_output, (dict, list)):
@@ -157,6 +208,11 @@ class Verifier:
                     issues.append("Output below minimum")
                 if maximum is not None and value > float(maximum):
                     issues.append("Output above maximum")
+        elif name == "looks_numeric":
+            try:
+                float(str(candidate_output).strip())
+            except (TypeError, ValueError):
+                issues.append("Output is not numeric")
         elif name == "unit_present":
             unit = check.params.get("unit")
             text = str(candidate_output)

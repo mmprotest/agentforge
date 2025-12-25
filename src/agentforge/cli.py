@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from typing import Any
 
 from agentforge.agent import Agent
@@ -126,25 +127,33 @@ def main() -> None:
         summary_lines=settings.summary_lines,
     )
     policy = SafetyPolicy(max_model_calls=settings.max_model_calls)
+    verify_override = "--verify" in sys.argv
+    strict_json_override = "--strict-json" in sys.argv or settings.strict_json_mode
+    code_check_override = "--code-check" in sys.argv or settings.code_check
+    code_check_iters_override = "--code-check-max-iters" in sys.argv
     agent = Agent(
         model=model,
         registry=registry,
         policy=policy,
         mode=settings.agent_mode,
-        verify=args.verify,
+        verify=True if verify_override else None,
         self_consistency=args.self_consistency,
         max_model_calls=settings.max_model_calls,
         memory=memory,
-        strict_json_mode=settings.strict_json_mode,
+        strict_json_mode=True if strict_json_override else None,
         max_message_chars=settings.max_message_chars,
         max_message_tokens_approx=settings.max_message_tokens_approx,
         token_char_ratio=settings.token_char_ratio,
         max_single_message_chars=settings.max_single_message_chars,
         max_turns=settings.max_turns,
         trim_strategy=settings.trim_strategy,
-        code_check=settings.code_check,
-        code_check_max_iters=settings.code_check_max_iters,
-        profile=args.profile or "agent",
+        code_check=True if code_check_override else None,
+        code_check_max_iters=(
+            settings.code_check_max_iters
+            if code_check_iters_override or settings.code_check_max_iters != 2
+            else None
+        ),
+        profile=args.profile,
     )
     result = agent.run(args.query)
     print("Tools used:", ", ".join(result.tools_used) or "none")
