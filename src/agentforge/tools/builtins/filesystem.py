@@ -26,8 +26,10 @@ class FileSystemTool(Tool):
 
     def _safe_path(self, path: str) -> Path:
         target = (self.workspace_dir / path).resolve()
-        if not str(target).startswith(str(self.workspace_dir)):
-            raise ValueError("Path traversal detected")
+        try:
+            target.relative_to(self.workspace_dir)
+        except ValueError as exc:
+            raise ValueError("Path traversal detected") from exc
         return target
 
     def run(self, data: BaseModel) -> ToolResult:

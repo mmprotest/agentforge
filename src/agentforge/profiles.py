@@ -100,7 +100,7 @@ def infer_profile(query: str) -> str:
         return "agent"
     if _CODE_RE.search(normalized):
         return "code"
-    if _MATH_RE.search(normalized) or _MATH_WORDS.search(normalized):
+    if _MATH_RE.search(normalized) or _MATH_WORDS.search(normalized) or _CONVERT_RE.search(normalized):
         return "math"
     if _QA_RE.search(normalized):
         return "qa"

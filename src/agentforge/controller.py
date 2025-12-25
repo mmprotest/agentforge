@@ -10,8 +10,13 @@ from pydantic import BaseModel
 
 from agentforge.policy_engine import PolicyEngine
 from agentforge.planner import safe_plan_to_graph
-from agentforge.profiles import infer_profile
-from agentforge.routing import is_code_task
+from agentforge.profiles import (
+    build_graph_agent,
+    build_graph_code,
+    build_graph_math,
+    infer_profile,
+)
+from agentforge.routing import is_code_task, suggest_tool
 from agentforge.tasks import CheckSpec, MicroTask, TaskGraph
 from agentforge.tools.registry import ToolRegistry
 from agentforge.util.logging import get_logger
@@ -36,15 +41,20 @@ class Action(BaseModel):
 class Controller:
     """Deterministic controller that decides next action."""
 
-    def __init__(self, policy_engine: PolicyEngine, registry: ToolRegistry) -> None:
+    def __init__(self, policy_engine: PolicyEngine, registry: ToolRegistry | None = None) -> None:
         self.policy_engine = policy_engine
-        self.registry = registry
+        self.registry = registry or ToolRegistry()
         self.logger = get_logger("agentforge.controller")
 
     def decide(self, state: "AgentState") -> Action:
         self._log_task_activity(state)
         if state.task_graph is None or not state.task_graph.tasks:
-            path_type, reason = self._select_path(state.query)
+            path_type, reason = self._select_path(
+                state.query,
+                profile=state.profile,
+                profile_explicit=state.profile_explicit,
+                code_check_enabled=bool(state.memory_state.get("code_check_enabled")),
+            )
             state.memory_state["path_type"] = path_type
             state.memory_state["path_reason"] = reason
             state.task_graph = self._initial_task_graph(
@@ -81,6 +91,8 @@ class Controller:
         if current_task is None:
             return Action(type=ActionType.FINAL, reason="no pending tasks")
         forced_tool = self._valid_tool_hint(current_task.tool_hint)
+        if forced_tool and self._check_includes_type(current_task.check, "code_run"):
+            forced_tool = None
         if forced_tool:
             retry_counts = state.memory_state.setdefault("forced_tool_attempts", {})
             attempts = retry_counts.get(current_task.id, 0)
@@ -179,10 +191,22 @@ class Controller:
     ) -> TaskGraph:
         if not profile_explicit or profile == "agent":
             profile = infer_profile(query)
-        if self._select_path(query)[0] == "fast":
-            graph = self._fast_task_graph(query)
-        else:
+        if profile == "code" or code_check_enabled:
+            graph = build_graph_code(query)
+        elif profile == "math":
+            graph = build_graph_math(query)
+        elif profile == "qa":
             graph = safe_plan_to_graph(query)
+        else:
+            if self._select_path(
+                query,
+                profile=profile,
+                profile_explicit=profile_explicit,
+                code_check_enabled=code_check_enabled,
+            )[0] == "fast":
+                graph = self._fast_task_graph(query)
+            else:
+                graph = build_graph_agent(query) if profile == "agent" else safe_plan_to_graph(query)
         graph.tasks = [self._strengthen_task(task) for task in graph.tasks]
         return graph
 
@@ -302,20 +326,36 @@ class Controller:
         tool = self.registry.get(tool_name)
         if tool is None:
             return False
+        if getattr(tool, "input_schema", None) is None:
+            return False
         schema = tool.input_schema.model_json_schema()
         required = schema.get("required") or []
         return bool(required)
 
-    def _select_path(self, query: str) -> tuple[str, str]:
+    def _select_path(
+        self,
+        query: str,
+        profile: str | None = None,
+        profile_explicit: bool = False,
+        code_check_enabled: bool = False,
+    ) -> tuple[str, str]:
         text = query.strip()
         if not text:
             return "fast", "empty_query"
+        if profile_explicit and profile and profile != "agent":
+            return "slow", "explicit_profile"
+        if profile in {"code", "math", "qa"}:
+            return "slow", "profile_inferred"
+        if code_check_enabled:
+            return "slow", "code_check"
         if self._is_mcq(text):
             return "fast", "mcq"
         if self._is_simple_math(text):
             return "fast", "simple_math"
         if self._is_slow_task(text):
             return "slow", "complex_or_tool_heavy"
+        if self._has_tool_intent(text):
+            return "slow", "tool_intent"
         if self._is_short_factual(text):
             return "fast", "short_factual"
         return "slow", "default"
@@ -358,9 +398,25 @@ class Controller:
         lowered = text.lower()
         if is_code_task(text):
             return True
-        if any(token in lowered for token in ["steps", "multi-step", "plan", "implement", "build", "analyze", "do work"]):
+        if any(
+            token in lowered
+            for token in [
+                "steps",
+                "multi-step",
+                "plan",
+                "implement",
+                "build",
+                "analyze",
+                "do work",
+                "tool",
+            ]
+        ):
             return True
         return False
+
+    def _has_tool_intent(self, text: str) -> bool:
+        suggestion = suggest_tool(f"User query: {text}")
+        return suggestion is not None
 
     def _log_task_activity(self, state: "AgentState") -> None:
         tool_event_id = state.memory_state.get("tool_event_id")

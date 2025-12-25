@@ -35,8 +35,10 @@ class CodeRunMultiTool(Tool):
         run_dir.mkdir(parents=True, exist_ok=True)
         for rel_path, content in payload.files.items():
             target = (run_dir / rel_path).resolve()
-            if not str(target).startswith(str(run_dir)):
-                raise ValueError("File path escapes run directory")
+            try:
+                target.relative_to(run_dir)
+            except ValueError as exc:
+                raise ValueError("File path escapes run directory") from exc
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
         command_parts = shlex.split(payload.command)
