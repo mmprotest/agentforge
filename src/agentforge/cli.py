@@ -80,6 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-single-message-chars", type=int, dest="max_single_message_chars")
     parser.add_argument("--max-turns", type=int, dest="max_turns")
     parser.add_argument("--profile", dest="profile", choices=["agent", "code", "math", "qa"])
+    parser.add_argument("--branch-candidates", type=int, dest="branch_candidates")
     return parser.parse_args()
 
 
@@ -113,6 +114,8 @@ def apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
         data["max_single_message_chars"] = args.max_single_message_chars
     if args.max_turns:
         data["max_turns"] = args.max_turns
+    if args.branch_candidates is not None:
+        data["branch_candidates"] = args.branch_candidates
     return Settings(**data)
 
 
@@ -154,6 +157,7 @@ def main() -> None:
             else None
         ),
         profile=args.profile,
+        branch_candidates=settings.branch_candidates,
     )
     result = agent.run(args.query)
     print("Tools used:", ", ".join(result.tools_used) or "none")

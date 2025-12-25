@@ -26,6 +26,9 @@ class DummyTool(Tool):
 
 def test_tool_error_recovery_returns_final(tmp_path):
     scripted = [
+        ModelResponse(
+            final_text='{"type":"final","answer":"step1","confidence":0.2,"checks":[]}'
+        ),
         ModelResponse(tool_call=ToolCall(name="dummy", arguments={})),
         ModelResponse(tool_call=ToolCall(name="dummy", arguments={"value": 3})),
         ModelResponse(
@@ -63,7 +66,11 @@ def test_tool_error_recovery_includes_retry_instruction():
             return super().chat(messages, tools)
 
     scripted = [
+        ModelResponse(
+            final_text='{"type":"final","answer":"step1","confidence":0.2,"checks":[]}'
+        ),
         ModelResponse(tool_call=ToolCall(name="dummy", arguments={})),
+        ModelResponse(tool_call=ToolCall(name="dummy", arguments={"value": 2})),
         ModelResponse(
             final_text='{"type":"final","answer":"ok","confidence":0.2,"checks":[]}'
         ),

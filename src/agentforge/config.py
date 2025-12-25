@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     trim_strategy: Literal["drop_oldest"] = Field(
         default="drop_oldest", validation_alias="TRIM_STRATEGY"
     )
+    branch_candidates: int = Field(default=1, validation_alias="BRANCH_CANDIDATES")
     strict_json_mode: bool = Field(default=False, validation_alias="STRICT_JSON_MODE")
     code_check: bool = Field(default=False, validation_alias="CODE_CHECK")
     code_check_max_iters: int = Field(

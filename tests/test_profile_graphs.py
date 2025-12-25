@@ -40,3 +40,15 @@ def test_controller_selects_profile_graph():
         "2+2", "math", True, code_check_enabled=False
     )
     assert graph_code.tasks[0].id != graph_math.tasks[0].id
+
+
+def test_controller_infers_profile_when_not_explicit():
+    controller = Controller(PolicyEngine(get_profile("agent")))
+    graph = controller._initial_task_graph(
+        "implement python function for sorting",
+        "agent",
+        False,
+        code_check_enabled=True,
+    )
+    assert graph.tasks[0].id == "draft"
+    assert any(not _is_weak_check(task) for task in graph.tasks)

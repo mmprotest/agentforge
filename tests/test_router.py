@@ -1,7 +1,7 @@
 import json
 
 from agentforge.agent import Agent
-from agentforge.models.base import BaseChatModel, ModelResponse, ToolCall
+from agentforge.models.base import BaseChatModel, ModelResponse
 from agentforge.models.mock import MockChatModel
 from agentforge.routing import suggest_tool
 from agentforge.safety.policy import SafetyPolicy
@@ -90,10 +90,9 @@ def test_router_hints_are_ephemeral():
             return ToolResult(output={"ok": True, "value": payload.value})
 
     scripted = [
-        ModelResponse(tool_call=ToolCall(name="dummy", arguments={})),
-        ModelResponse(
-            final_text='{"type":"final","answer":"done","confidence":0.2,"checks":[]}'
-        ),
+        ModelResponse(final_text='{"type":"final","answer":"step1","confidence":0.2,"checks":[]}'),
+        ModelResponse(final_text='{"type":"final","answer":"step2","confidence":0.2,"checks":[]}'),
+        ModelResponse(final_text='{"type":"final","answer":"done","confidence":0.2,"checks":[]}'),
     ]
     model = CaptureModel(scripted=scripted)
     registry = ToolRegistry()
@@ -102,6 +101,8 @@ def test_router_hints_are_ephemeral():
         model=model,
         registry=registry,
         policy=SafetyPolicy(max_model_calls=5),
+        profile="qa",
+        verify=False,
     )
     result = agent.run('Use regex /foo/ on "foo bar"')
     assert "done" in result.answer

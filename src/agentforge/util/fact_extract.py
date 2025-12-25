@@ -10,15 +10,34 @@ MAX_FACTS = 20
 MAX_FACT_LEN = 200
 
 
-def extract_facts(tool_name: str, tool_output: Any, summary_text: str) -> list[str]:
-    facts: list[str] = []
+def extract_facts(
+    tool_name: str,
+    tool_output: Any,
+    summary_text: str,
+    source: str | None = None,
+) -> list[str]:
+    structured = extract_facts_structured(tool_name, tool_output, summary_text, source=source)
+    return _finalize_facts([item["value"] for item in structured])
+
+
+def extract_facts_structured(
+    tool_name: str,
+    tool_output: Any,
+    summary_text: str,
+    source: str | None = None,
+) -> list[dict[str, str | None]]:
+    facts: list[dict[str, str | None]] = []
     raw_text = _stringify(tool_output)
     combined_text = f"{summary_text}\n{raw_text}"
-    facts.extend(_extract_urls(combined_text))
-    facts.extend(_extract_numbers_with_units(combined_text))
-    facts.extend(_extract_key_values(tool_output))
-    facts.extend(_extract_summary_bullets(summary_text))
-    return _finalize_facts(facts)
+    facts.extend(_wrap("url", _extract_urls(combined_text), source))
+    facts.extend(_wrap("number", _extract_numbers_with_units(combined_text), source))
+    facts.extend(_wrap("kv", _extract_key_values(tool_output), source))
+    facts.extend(_wrap("snippet", _extract_summary_bullets(summary_text), source))
+    return _finalize_structured_facts(facts)
+
+
+def _wrap(kind: str, values: list[str], source: str | None) -> list[dict[str, str | None]]:
+    return [{"kind": kind, "value": value, "source": source} for value in values]
 
 
 def _stringify(value: Any) -> str:
@@ -71,6 +90,28 @@ def _finalize_facts(facts: list[str]) -> list[str]:
             continue
         seen.add(cleaned)
         result.append(cleaned)
+        if len(result) >= MAX_FACTS:
+            break
+    return result
+
+
+def _finalize_structured_facts(
+    facts: list[dict[str, str | None]],
+) -> list[dict[str, str | None]]:
+    seen: set[tuple[str, str]] = set()
+    result: list[dict[str, str | None]] = []
+    for fact in facts:
+        value = str(fact.get("value") or "").strip()
+        if not value:
+            continue
+        if len(value) > MAX_FACT_LEN:
+            value = value[: MAX_FACT_LEN - 3] + "..."
+        kind = str(fact.get("kind") or "snippet")
+        key = (kind, value)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append({"kind": kind, "value": value, "source": fact.get("source")})
         if len(result) >= MAX_FACTS:
             break
     return result

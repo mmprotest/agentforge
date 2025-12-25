@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 
 from agentforge.tasks import CheckSpec, MicroTask, TaskGraph
@@ -37,7 +38,7 @@ class ProfileConfig:
 PROFILES: dict[str, ProfileConfig] = {
     "agent": ProfileConfig(
         name="agent",
-        budgets=BudgetConfig(model_calls=20, tool_calls=6, backtracks=2, verifies=4),
+        budgets=BudgetConfig(model_calls=20, tool_calls=6, backtracks=2, verifies=6),
         strict_json_default=False,
         verify_default=False,
         code_check_default=False,
@@ -67,7 +68,7 @@ PROFILES: dict[str, ProfileConfig] = {
     ),
     "qa": ProfileConfig(
         name="qa",
-        budgets=BudgetConfig(model_calls=20, tool_calls=4, backtracks=3, verifies=4),
+        budgets=BudgetConfig(model_calls=20, tool_calls=4, backtracks=3, verifies=6),
         strict_json_default=False,
         verify_default=True,
         code_check_default=False,
@@ -77,11 +78,33 @@ PROFILES: dict[str, ProfileConfig] = {
     ),
 }
 
+_MATH_RE = re.compile(r"[\d\)][\s]*[+\-*/][\s]*[\d\(]")
+_MATH_WORDS = re.compile(r"\bcalculate\b|\bcompute\b|\bsum\b|\badd\b|\bmultiply\b|\bdivide\b")
+_CONVERT_RE = re.compile(r"\bconvert\b|\bunit\b|\bto\b", re.IGNORECASE)
+_QA_RE = re.compile(r"\bsource\b|\bcitation\b|\bcite\b|\bweb\b|\bwebsite\b|\bhttp", re.IGNORECASE)
+_CODE_RE = re.compile(
+    r"\bpython\b|\bcode\b|\bimplement\b|\bfunction\b|\btests\b|```",
+    re.IGNORECASE,
+)
+
 
 def get_profile(name: str | None) -> ProfileConfig:
     if name and name in PROFILES:
         return PROFILES[name]
     return PROFILES["agent"]
+
+
+def infer_profile(query: str) -> str:
+    normalized = query.strip()
+    if not normalized:
+        return "agent"
+    if _CODE_RE.search(normalized):
+        return "code"
+    if _MATH_RE.search(normalized) or _MATH_WORDS.search(normalized):
+        return "math"
+    if _QA_RE.search(normalized):
+        return "qa"
+    return "agent"
 
 
 def build_graph_code(query: str) -> TaskGraph:
@@ -120,6 +143,7 @@ def build_graph_code(query: str) -> TaskGraph:
 
 
 def build_graph_math(query: str) -> TaskGraph:
+    tool_hint = "unit_convert" if _CONVERT_RE.search(query) else "calculator"
     tasks = [
         _task(
             "parse",
@@ -139,7 +163,7 @@ def build_graph_math(query: str) -> TaskGraph:
             "compute",
             "Compute with calculator",
             CheckSpec(type="tool_recompute", params={}),
-            tool_hint="calculator",
+            tool_hint=tool_hint,
         ),
         _task(
             "final",

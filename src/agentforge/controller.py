@@ -13,9 +13,10 @@ from agentforge.profiles import (
     build_graph_code,
     build_graph_math,
     build_graph_qa,
+    infer_profile,
 )
 from agentforge.routing import is_code_task
-from agentforge.tasks import CheckSpec, MicroTask, TaskGraph
+from agentforge.tasks import CheckSpec, TaskGraph
 
 
 class ActionType(str, Enum):
@@ -120,155 +121,16 @@ class Controller:
         profile_explicit: bool,
         code_check_enabled: bool,
     ) -> TaskGraph:
-        if profile_explicit:
-            if profile == "code":
-                graph = build_graph_code(query)
-            elif profile == "math":
-                graph = build_graph_math(query)
-            elif profile == "qa":
-                graph = build_graph_qa(query)
-            else:
-                graph = build_graph_agent(query)
+        if not profile_explicit or profile == "agent":
+            profile = infer_profile(query)
+        if profile == "code" or is_code_task(query):
+            graph = build_graph_code(query)
+        elif profile == "math":
+            graph = build_graph_math(query)
+        elif profile == "qa":
+            graph = build_graph_qa(query)
         else:
-            tasks: list[MicroTask] = []
-            normalized = query.lower()
-            if is_code_task(query) or profile == "code":
-                tasks.append(
-                    MicroTask(
-                        id="draft",
-                        goal="Draft solution",
-                        inputs={},
-                        expected_schema=None,
-                        tool_hint=None,
-                        check=CheckSpec(type="predicate", params={"name": "non_empty"}),
-                        status="pending",
-                        attempts=0,
-                    )
-                )
-                if code_check_enabled or profile == "code":
-                    tasks.append(
-                        MicroTask(
-                            id="code_check",
-                            goal="Run code-check",
-                            inputs={"source_key": "draft_answer"},
-                            expected_schema=None,
-                            tool_hint="python_sandbox",
-                            check=CheckSpec(type="code_run", params={"source_key": "draft_answer"}),
-                            status="pending",
-                            attempts=0,
-                        )
-                    )
-                tasks.append(
-                    MicroTask(
-                        id="final",
-                        goal="Finalize",
-                        inputs={},
-                        expected_schema=None,
-                        tool_hint=None,
-                        check=CheckSpec(type="predicate", params={"name": "non_empty"}),
-                        status="pending",
-                        attempts=0,
-                    )
-                )
-            elif any(
-                token in normalized
-                for token in ["calculate", "compute", "sum", "add", "multiply", "divide"]
-            ):
-                tasks.extend(
-                    [
-                        MicroTask(
-                            id="compute",
-                            goal="Compute with calculator",
-                            inputs={},
-                            expected_schema=None,
-                            tool_hint="calculator",
-                            check=CheckSpec(type="tool_recompute", params={}),
-                            status="pending",
-                            attempts=0,
-                        ),
-                        MicroTask(
-                            id="verify",
-                            goal="Verify constraints",
-                            inputs={},
-                            expected_schema=None,
-                            tool_hint=None,
-                            check=CheckSpec(type="predicate", params={"name": "non_empty"}),
-                            status="pending",
-                            attempts=0,
-                        ),
-                        MicroTask(
-                            id="final",
-                            goal="Finalize",
-                            inputs={},
-                            expected_schema=None,
-                            tool_hint=None,
-                            check=CheckSpec(type="predicate", params={"name": "non_empty"}),
-                            status="pending",
-                            attempts=0,
-                        ),
-                    ]
-                )
-            elif "http" in normalized or "source" in normalized or "web" in normalized:
-                tasks.extend(
-                    [
-                        MicroTask(
-                            id="fetch",
-                            goal="Fetch sources",
-                            inputs={},
-                            expected_schema=None,
-                            tool_hint="http_fetch",
-                            check=CheckSpec(type="predicate", params={"name": "non_empty"}),
-                            status="pending",
-                            attempts=0,
-                        ),
-                        MicroTask(
-                            id="extract",
-                            goal="Extract facts",
-                            inputs={},
-                            expected_schema=None,
-                            tool_hint=None,
-                            check=CheckSpec(type="predicate", params={"name": "non_empty"}),
-                            status="pending",
-                            attempts=0,
-                        ),
-                        MicroTask(
-                            id="final",
-                            goal="Finalize",
-                            inputs={},
-                            expected_schema=None,
-                            tool_hint=None,
-                            check=CheckSpec(type="predicate", params={"name": "non_empty"}),
-                            status="pending",
-                            attempts=0,
-                        ),
-                    ]
-                )
-            else:
-                tasks.extend(
-                    [
-                        MicroTask(
-                            id="draft",
-                            goal="Draft response",
-                            inputs={},
-                            expected_schema=None,
-                            tool_hint=None,
-                            check=CheckSpec(type="predicate", params={"name": "non_empty"}),
-                            status="pending",
-                            attempts=0,
-                        ),
-                        MicroTask(
-                            id="final",
-                            goal="Finalize",
-                            inputs={},
-                            expected_schema=None,
-                            tool_hint=None,
-                            check=CheckSpec(type="predicate", params={"name": "non_empty"}),
-                            status="pending",
-                            attempts=0,
-                        ),
-                    ]
-                )
-            graph = TaskGraph(tasks=tasks, current_task_id=None, history=[])
+            graph = build_graph_agent(query)
         graph.tasks = [self._strengthen_task(task) for task in graph.tasks]
         return graph
 
@@ -304,7 +166,9 @@ class Controller:
 
         memory_keys = [
             "facts",
+            "facts_structured",
             "constraints",
+            "intermediates",
             "draft_answer",
             "candidate_output",
             "candidate_source",
