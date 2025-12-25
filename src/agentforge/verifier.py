@@ -13,11 +13,19 @@ from agentforge.tasks import CheckSpec, MicroTask
 
 
 @dataclass
+class FailureDetail:
+    check_name: str
+    reason: str
+    expected: Any | None = None
+    got: Any | None = None
+    minimal_fix: str | None = None
+
+
+@dataclass
 class VerifierResult:
-    ok: bool
-    issues: list[str]
+    passed: bool
+    failures: list[FailureDetail]
     checks_run: list[str]
-    suggested_fix: str | None = None
 
 
 class Verifier:
@@ -29,44 +37,40 @@ class Verifier:
     def verify(
         self, candidate_output: Any, task: MicroTask
     ) -> VerifierResult:
-        issues, checks_run = self._evaluate_check(task.check, candidate_output, task)
-        ok = not issues
-        suggested_fix = None
-        if not ok:
-            suggested_fix = task.check.params.get("suggested_fix")
+        failures, checks_run = self._evaluate_check(task.check, candidate_output, task)
+        passed = not failures
         return VerifierResult(
-            ok=ok,
-            issues=issues,
+            passed=passed,
+            failures=failures,
             checks_run=checks_run,
-            suggested_fix=suggested_fix,
         )
 
     def _evaluate_check(
         self, check: CheckSpec, candidate_output: Any, task: MicroTask
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[FailureDetail], list[str]]:
         checks_run: list[str] = []
-        issues: list[str] = []
+        failures: list[FailureDetail] = []
         if check.all_of:
             checks_run.append("all_of")
             for subcheck in check.all_of:
-                sub_issues, sub_checks = self._evaluate_check(
+                sub_failures, sub_checks = self._evaluate_check(
                     subcheck, candidate_output, task
                 )
                 checks_run.extend(sub_checks)
-                issues.extend(sub_issues)
-            return issues, checks_run
+                failures.extend(sub_failures)
+            return failures, checks_run
         if check.any_of:
             checks_run.append("any_of")
             any_ok = False
-            aggregated: list[str] = []
+            aggregated: list[FailureDetail] = []
             for subcheck in check.any_of:
-                sub_issues, sub_checks = self._evaluate_check(
+                sub_failures, sub_checks = self._evaluate_check(
                     subcheck, candidate_output, task
                 )
                 checks_run.extend(sub_checks)
-                if not sub_issues:
+                if not sub_failures:
                     any_ok = True
-                aggregated.extend(sub_issues)
+                aggregated.extend(sub_failures)
             if any_ok:
                 return [], checks_run
             return aggregated, checks_run
@@ -76,54 +80,224 @@ class Verifier:
             checks_run.append("schema")
             payload = self._load_json(candidate_output)
             if payload is None:
-                issues.append("Output is not valid JSON")
+                failures.append(
+                    FailureDetail(
+                        check_name="schema",
+                        reason="Output is not valid JSON",
+                        expected="JSON object matching schema",
+                        got=candidate_output,
+                        minimal_fix="Return valid JSON that matches the required schema.",
+                    )
+                )
             else:
-                issues.extend(self._validate_schema(task.expected_schema or {}, payload))
+                schema = check.params.get("schema") or task.expected_schema or {}
+                schema_issues = self._validate_schema(schema, payload)
+                for issue in schema_issues:
+                    failures.append(
+                        FailureDetail(
+                            check_name="schema",
+                            reason=issue,
+                            expected=schema,
+                            got=payload,
+                            minimal_fix="Ensure the JSON schema requirements are satisfied.",
+                        )
+                    )
         elif check.type == "regex":
             checks_run.append("regex")
             pattern = str(check.params.get("pattern") or "")
             if not pattern:
-                issues.append("Missing regex pattern")
+                failures.append(
+                    FailureDetail(
+                        check_name="regex",
+                        reason="Missing regex pattern",
+                        expected="pattern",
+                        got=None,
+                        minimal_fix="Provide a regex pattern to match.",
+                    )
+                )
             else:
                 if not re.search(pattern, str(candidate_output), re.DOTALL):
-                    issues.append(f"Output did not match /{pattern}/")
+                    failures.append(
+                        FailureDetail(
+                            check_name="regex",
+                            reason=f"Output did not match /{pattern}/",
+                            expected=pattern,
+                            got=str(candidate_output),
+                            minimal_fix=f"Ensure the output matches /{pattern}/.",
+                        )
+                    )
+        elif check.type == "exact":
+            checks_run.append("exact")
+            expected = check.params.get("expected")
+            if str(candidate_output) != str(expected):
+                failures.append(
+                    FailureDetail(
+                        check_name="exact",
+                        reason="Output did not match expected value",
+                        expected=expected,
+                        got=candidate_output,
+                        minimal_fix=f"Return exactly: {expected}",
+                    )
+                )
+        elif check.type == "numeric_tolerance":
+            checks_run.append("numeric_tolerance")
+            expected = check.params.get("expected")
+            tolerance = float(check.params.get("tolerance", 1e-6))
+            if not numeric_close(candidate_output, expected, rel=tolerance, abs=tolerance):
+                failures.append(
+                    FailureDetail(
+                        check_name="numeric_tolerance",
+                        reason="Output not within numeric tolerance",
+                        expected=expected,
+                        got=candidate_output,
+                        minimal_fix=(
+                            f"Return a number within ±{tolerance} of {expected}."
+                        ),
+                    )
+                )
+        elif check.type == "unit_sanity":
+            checks_run.append("unit_sanity")
+            unit = check.params.get("unit")
+            if unit and str(unit) not in str(candidate_output):
+                failures.append(
+                    FailureDetail(
+                        check_name="unit_sanity",
+                        reason=f"Missing unit '{unit}'",
+                        expected=unit,
+                        got=str(candidate_output),
+                        minimal_fix=f"Include the unit '{unit}' in the answer.",
+                    )
+                )
         elif check.type == "predicate":
             checks_run.append("predicate")
-            issues.extend(self._run_predicate(check, candidate_output))
+            issues = self._run_predicate(check, candidate_output)
+            failures.extend(self._predicate_failures(check, issues, candidate_output))
         elif check.type == "contains_fields":
             checks_run.append("contains_fields")
             fields = check.params.get("required_fields") or []
             payload = self._load_json(candidate_output)
             if not isinstance(payload, dict):
-                issues.append("Output is not a JSON object")
+                failures.append(
+                    FailureDetail(
+                        check_name="contains_fields",
+                        reason="Output is not a JSON object",
+                        expected=fields,
+                        got=payload,
+                        minimal_fix="Return a JSON object with required fields.",
+                    )
+                )
             else:
                 for field in fields:
                     if field not in payload:
-                        issues.append(f"Missing field '{field}'")
+                        failures.append(
+                            FailureDetail(
+                                check_name="contains_fields",
+                                reason=f"Missing field '{field}'",
+                                expected=fields,
+                                got=payload,
+                                minimal_fix=f"Include field '{field}' in the JSON output.",
+                            )
+                        )
         elif check.type == "json_protocol":
             checks_run.append("json_protocol")
             required_keys = check.params.get("required_keys") or ["answer"]
             payload = self._load_json(candidate_output)
             if not isinstance(payload, dict):
-                issues.append("Output is not a JSON object")
+                failures.append(
+                    FailureDetail(
+                        check_name="json_protocol",
+                        reason="Output is not a JSON object",
+                        expected=required_keys,
+                        got=payload,
+                        minimal_fix="Return a JSON object with the required keys.",
+                    )
+                )
             else:
                 for field in required_keys:
                     if field not in payload:
-                        issues.append(f"Missing protocol key '{field}'")
+                        failures.append(
+                            FailureDetail(
+                                check_name="json_protocol",
+                                reason=f"Missing protocol key '{field}'",
+                                expected=required_keys,
+                                got=payload,
+                                minimal_fix=f"Include key '{field}' in the JSON output.",
+                            )
+                        )
         elif check.type == "tool_error_absent":
             checks_run.append("tool_error_absent")
             tool_output = check.params.get("tool_output", candidate_output)
             if isinstance(tool_output, dict) and tool_output.get("ok") is False:
-                issues.append("Tool output indicates failure")
+                failures.append(
+                    FailureDetail(
+                        check_name="tool_error_absent",
+                        reason="Tool output indicates failure",
+                        expected="Tool output ok",
+                        got=tool_output,
+                        minimal_fix="Fix tool arguments and rerun the tool.",
+                    )
+                )
         elif check.type == "tool_recompute":
             checks_run.append("tool_recompute")
-            issues.extend(self._run_tool_recompute(check, candidate_output))
+            issues = self._run_tool_recompute(check, candidate_output)
+            for issue in issues:
+                failures.append(
+                    FailureDetail(
+                        check_name="tool_recompute",
+                        reason=issue,
+                        expected="Match tool output",
+                        got=candidate_output,
+                        minimal_fix="Match the tool recompute output exactly.",
+                    )
+                )
         elif check.type == "code_run":
             checks_run.append("code_run")
-            issues.extend(self._run_code_check(check, candidate_output))
+            issues = self._run_code_check(check, candidate_output)
+            for issue in issues:
+                failures.append(
+                    FailureDetail(
+                        check_name="code_run",
+                        reason=issue,
+                        expected="Python code executes without errors",
+                        got=candidate_output,
+                        minimal_fix="Fix the code so it runs without errors.",
+                    )
+                )
         else:
-            issues.append(f"Unknown check type: {check.type}")
-        return issues, checks_run
+            failures.append(
+                FailureDetail(
+                    check_name=check.type,
+                    reason=f"Unknown check type: {check.type}",
+                    expected=None,
+                    got=None,
+                    minimal_fix="Update the check type to a supported value.",
+                )
+            )
+        return failures, checks_run
+
+    def _predicate_failures(
+        self, check: CheckSpec, issues: list[str], candidate_output: Any
+    ) -> list[FailureDetail]:
+        failures: list[FailureDetail] = []
+        name = str(check.params.get("name") or "non_empty")
+        for issue in issues:
+            minimal_fix = "Adjust the output to satisfy the predicate."
+            if name == "non_empty":
+                minimal_fix = "Return a non-empty response."
+            elif name == "looks_numeric":
+                minimal_fix = "Return a numeric value."
+            elif name == "numeric_range":
+                minimal_fix = "Return a value within the specified range."
+            failures.append(
+                FailureDetail(
+                    check_name=f"predicate:{name}",
+                    reason=issue,
+                    expected=check.params,
+                    got=candidate_output,
+                    minimal_fix=minimal_fix,
+                )
+            )
+        return failures
 
     def _load_json(self, candidate_output: Any) -> Any | None:
         if isinstance(candidate_output, (dict, list)):

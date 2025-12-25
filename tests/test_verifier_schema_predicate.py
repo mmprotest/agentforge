@@ -19,9 +19,9 @@ def test_verifier_schema_and_predicate():
         attempts=0,
     )
     ok = verifier.verify({"answer": "ok"}, schema_task)
-    assert ok.ok
+    assert ok.passed
     bad = verifier.verify({"nope": "x"}, schema_task)
-    assert not bad.ok
+    assert not bad.passed
     predicate_task = MicroTask(
         id="predicate",
         goal="Check predicate",
@@ -32,5 +32,5 @@ def test_verifier_schema_and_predicate():
         status="pending",
         attempts=0,
     )
-    assert verifier.verify("hello", predicate_task).ok
-    assert not verifier.verify("", predicate_task).ok
+    assert verifier.verify("hello", predicate_task).passed
+    assert not verifier.verify("", predicate_task).passed

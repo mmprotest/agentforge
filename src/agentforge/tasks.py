@@ -15,6 +15,9 @@ class CheckSpec(BaseModel):
         "json_protocol",
         "schema",
         "regex",
+        "exact",
+        "numeric_tolerance",
+        "unit_sanity",
         "predicate",
         "tool_recompute",
         "code_run",
@@ -37,6 +40,7 @@ class MicroTask(BaseModel):
     check: CheckSpec
     status: Literal["pending", "running", "done", "failed", "blocked"]
     attempts: int
+    max_attempts: int = 2
     notes: str | None = None
 
 

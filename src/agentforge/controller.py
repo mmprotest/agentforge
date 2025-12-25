@@ -8,13 +8,8 @@ from typing import Any
 from pydantic import BaseModel
 
 from agentforge.policy_engine import PolicyEngine
-from agentforge.profiles import (
-    build_graph_agent,
-    build_graph_code,
-    build_graph_math,
-    build_graph_qa,
-    infer_profile,
-)
+from agentforge.planner import safe_plan_to_graph
+from agentforge.profiles import infer_profile
 from agentforge.routing import is_code_task
 from agentforge.tasks import CheckSpec, TaskGraph
 
@@ -77,14 +72,14 @@ class Controller:
         ):
             return Action(type=ActionType.VERIFY, reason="finalize candidate")
         if (
-            current_task.check.type == "code_run"
+            self._check_includes_type(current_task.check, "code_run")
             and state.memory_state.get(current_task.inputs.get("source_key"))
             and state.budgets.verifies > 0
             and not state.memory_state.get("needs_revision")
         ):
             return Action(type=ActionType.VERIFY, reason="code check ready")
         if (
-            current_task.check.type == "tool_recompute"
+            self._check_includes_type(current_task.check, "tool_recompute")
             and state.memory_state.get("last_tool_output") is not None
             and state.budgets.verifies > 0
             and not state.memory_state.get("needs_revision")
@@ -92,7 +87,13 @@ class Controller:
             return Action(type=ActionType.VERIFY, reason="tool recompute ready")
 
         routing_prompt = state.routing_prompt
-        decision = self.policy_engine.route(routing_prompt) if routing_prompt else None
+        decision = (
+            self.policy_engine.route(
+                routing_prompt, penalties=state.memory_state.get("route_penalties", {})
+            )
+            if routing_prompt
+            else None
+        )
         if decision and decision.must_call and state.budgets.tool_calls > 0:
             return Action(
                 type=ActionType.ROUTE_TOOL,
@@ -123,14 +124,7 @@ class Controller:
     ) -> TaskGraph:
         if not profile_explicit or profile == "agent":
             profile = infer_profile(query)
-        if profile == "code" or is_code_task(query):
-            graph = build_graph_code(query)
-        elif profile == "math":
-            graph = build_graph_math(query)
-        elif profile == "qa":
-            graph = build_graph_qa(query)
-        else:
-            graph = build_graph_agent(query)
+        graph = safe_plan_to_graph(query)
         graph.tasks = [self._strengthen_task(task) for task in graph.tasks]
         return graph
 
@@ -222,3 +216,16 @@ class Controller:
         if hint:
             return f"{hint}\n[Fix] {fix}"
         return f"[Fix] {fix}"
+
+    def _check_includes_type(self, check: CheckSpec, check_type: str) -> bool:
+        if check.type == check_type:
+            return True
+        if check.all_of and any(
+            self._check_includes_type(sub, check_type) for sub in check.all_of
+        ):
+            return True
+        if check.any_of and any(
+            self._check_includes_type(sub, check_type) for sub in check.any_of
+        ):
+            return True
+        return False

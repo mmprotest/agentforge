@@ -48,6 +48,7 @@ class RunRequest(BaseModel):
     max_single_message_chars: int | None = None
     max_turns: int | None = None
     branch_candidates: int | None = None
+    eval_mode: bool | None = None
 
 
 class RunResponse(BaseModel):
@@ -121,6 +122,8 @@ async def run_agent(request: RunRequest) -> RunResponse:
         settings.max_turns = request.max_turns
     if request.branch_candidates is not None:
         settings.branch_candidates = request.branch_candidates
+    if request.eval_mode is not None:
+        settings.eval_mode = request.eval_mode
     model = build_model(settings)
     registry = build_registry(settings, model)
     memory = MemoryStore(
@@ -163,6 +166,7 @@ async def run_agent(request: RunRequest) -> RunResponse:
         ),
         profile=profile,
         branch_candidates=settings.branch_candidates,
+        eval_mode=settings.eval_mode,
     )
     result = agent.run(request.query)
     return RunResponse(

@@ -28,8 +28,8 @@ def test_verifier_all_of_any_of():
             CheckSpec(type="contains_fields", params={"required_fields": ["answer"]}),
         ],
     )
-    assert verifier.verify({"answer": "ok"}, _task(all_check)).ok
-    assert not verifier.verify({}, _task(all_check)).ok
+    assert verifier.verify({"answer": "ok"}, _task(all_check)).passed
+    assert not verifier.verify({}, _task(all_check)).passed
 
     any_check = CheckSpec(
         type="none",
@@ -38,21 +38,21 @@ def test_verifier_all_of_any_of():
             CheckSpec(type="contains_fields", params={"required_fields": ["answer"]}),
         ],
     )
-    assert verifier.verify("hi", _task(any_check)).ok
-    assert verifier.verify({"answer": "ok"}, _task(any_check)).ok
-    assert not verifier.verify("nope", _task(any_check)).ok
+    assert verifier.verify("hi", _task(any_check)).passed
+    assert verifier.verify({"answer": "ok"}, _task(any_check)).passed
+    assert not verifier.verify("nope", _task(any_check)).passed
 
 
 def test_verifier_contains_fields_json_protocol_tool_error_absent():
     verifier = Verifier(_noop_tool_runner)
     contains = CheckSpec(type="contains_fields", params={"required_fields": ["answer"]})
-    assert verifier.verify({"answer": "ok"}, _task(contains)).ok
-    assert not verifier.verify("plain", _task(contains)).ok
+    assert verifier.verify({"answer": "ok"}, _task(contains)).passed
+    assert not verifier.verify("plain", _task(contains)).passed
 
     protocol = CheckSpec(type="json_protocol", params={"required_keys": ["type", "answer"]})
-    assert verifier.verify({"type": "final", "answer": "ok"}, _task(protocol)).ok
-    assert not verifier.verify({"answer": "ok"}, _task(protocol)).ok
+    assert verifier.verify({"type": "final", "answer": "ok"}, _task(protocol)).passed
+    assert not verifier.verify({"answer": "ok"}, _task(protocol)).passed
 
     tool_ok = CheckSpec(type="tool_error_absent")
-    assert verifier.verify({"ok": True, "value": 1}, _task(tool_ok)).ok
-    assert not verifier.verify({"ok": False, "error": "bad"}, _task(tool_ok)).ok
+    assert verifier.verify({"ok": True, "value": 1}, _task(tool_ok)).passed
+    assert not verifier.verify({"ok": False, "error": "bad"}, _task(tool_ok)).passed

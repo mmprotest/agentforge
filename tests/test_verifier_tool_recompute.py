@@ -28,7 +28,7 @@ def test_tool_recompute_numeric_close():
         type="tool_recompute",
         params={"tool_name": "calculator", "tool_args": {"expression": "1+1"}},
     )
-    assert verifier.verify("2", _task(check)).ok
+    assert verifier.verify("2", _task(check)).passed
 
 
 def test_tool_recompute_text_normalize():
@@ -41,7 +41,7 @@ def test_tool_recompute_text_normalize():
             "compare": "text",
         },
     )
-    assert verifier.verify("hello   world", _task(check)).ok
+    assert verifier.verify("hello   world", _task(check)).passed
 
 
 def test_tool_recompute_dict_subset():
@@ -55,4 +55,4 @@ def test_tool_recompute_dict_subset():
             "subset_direction": "expected_in_actual",
         },
     )
-    assert verifier.verify({"value": 2}, _task(check)).ok
+    assert verifier.verify({"value": 2}, _task(check)).passed

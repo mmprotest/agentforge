@@ -1,0 +1,3 @@
+{"id":"sample-1","input":"2+2","expected":"4"}
+{"id":"sample-2","input":"convert 1 km to m","expected":"1000"}
+{"id":"sample-3","input":"Extract /foo/ from \"foo bar\"","expected":"foo","pattern":"foo"}

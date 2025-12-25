@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from agentforge.profiles import ProfileConfig
-from agentforge.routing import RouteSuggestion, suggest_tool
+from agentforge.routing import RouteSuggestion, suggest_tools
 
 
 @dataclass(frozen=True)
@@ -25,18 +25,36 @@ class PolicyEngine:
     def __init__(self, profile: ProfileConfig) -> None:
         self.profile = profile
 
-    def route(self, routing_prompt: str) -> RouteDecision | None:
-        suggestion = suggest_tool(routing_prompt)
-        if suggestion is None:
+    def route(
+        self, routing_prompt: str, penalties: dict[str, int] | None = None
+    ) -> RouteDecision | None:
+        suggestions = suggest_tools(routing_prompt)
+        if not suggestions:
             return None
+        penalties = penalties or {}
         thresholds = self.profile.routing_thresholds
-        must_call = suggestion.confidence >= thresholds.must_call
-        suggest_only = thresholds.suggest <= suggestion.confidence < thresholds.must_call
+        adjusted: list[RouteSuggestion] = []
+        for suggestion in suggestions:
+            penalty = penalties.get(suggestion.tool_name, 0)
+            confidence = max(0.0, suggestion.confidence - 0.15 * penalty)
+            adjusted.append(
+                RouteSuggestion(
+                    tool_name=suggestion.tool_name,
+                    confidence=confidence,
+                    reason=suggestion.reason,
+                    suggested_args=suggestion.suggested_args,
+                )
+            )
+        best = max(adjusted, key=lambda suggestion: suggestion.confidence)
+        if best.confidence < thresholds.suggest:
+            return None
+        must_call = best.confidence >= thresholds.must_call
+        suggest_only = thresholds.suggest <= best.confidence < thresholds.must_call
         return RouteDecision(
-            tool_name=suggestion.tool_name,
-            confidence=suggestion.confidence,
-            reason=suggestion.reason,
-            suggested_args=suggestion.suggested_args,
+            tool_name=best.tool_name,
+            confidence=best.confidence,
+            reason=best.reason,
+            suggested_args=best.suggested_args,
             must_call=must_call,
             suggest_only=suggest_only,
         )

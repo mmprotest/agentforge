@@ -80,7 +80,7 @@ PROFILES: dict[str, ProfileConfig] = {
 
 _MATH_RE = re.compile(r"[\d\)][\s]*[+\-*/][\s]*[\d\(]")
 _MATH_WORDS = re.compile(r"\bcalculate\b|\bcompute\b|\bsum\b|\badd\b|\bmultiply\b|\bdivide\b")
-_CONVERT_RE = re.compile(r"\bconvert\b|\bunit\b|\bto\b", re.IGNORECASE)
+_CONVERT_RE = re.compile(r"\bconvert\b|\bunit\b", re.IGNORECASE)
 _QA_RE = re.compile(r"\bsource\b|\bcitation\b|\bcite\b|\bweb\b|\bwebsite\b|\bhttp", re.IGNORECASE)
 _CODE_RE = re.compile(
     r"\bpython\b|\bcode\b|\bimplement\b|\bfunction\b|\btests\b|```",
@@ -275,4 +275,5 @@ def _task(
         check=check,
         status="pending",
         attempts=0,
+        max_attempts=2,
     )

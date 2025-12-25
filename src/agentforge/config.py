@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     sandbox_passthrough_env: str | None = Field(
         default=None, validation_alias="SANDBOX_PASSTHROUGH_ENV"
     )
+    eval_mode: bool = Field(default=False, validation_alias="EVAL_MODE")
 
 
 DEFAULT_SETTINGS = Settings()
