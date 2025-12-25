@@ -10,6 +10,7 @@ from typing import Any
 from agentforge.agent import Agent
 from agentforge.config import Settings
 from agentforge.eval.runner import build_model, build_registry
+from agentforge.eval.mcq import normalize_mcq_answer
 from agentforge.failures import FailureTag
 from agentforge.memory import MemoryStore
 from agentforge.safety.policy import SafetyPolicy
@@ -22,6 +23,7 @@ from agentforge.scoring import (
     score_regex,
 )
 from agentforge.trace import TraceRecorder
+from agentforge.util.logging import get_logger
 
 
 def build_eval_parser() -> argparse.ArgumentParser:
@@ -44,6 +46,7 @@ def build_eval_parser() -> argparse.ArgumentParser:
 
 
 def run_eval_harness(args: argparse.Namespace) -> None:
+    logger = get_logger("agentforge.eval")
     settings = Settings()
     settings.eval_mode = bool(args.eval_mode)
     if args.summary_lines is not None:
@@ -91,8 +94,30 @@ def run_eval_harness(args: argparse.Namespace) -> None:
                 eval_mode=True,
             )
             result = agent.run(query)
-            score = _score_sample(args, result.answer, expected, payload)
+            is_mcq = _is_mcq_sample(payload, expected, query)
+            score = _score_sample(args, result.answer, expected, payload, is_mcq)
             failure_tags = _collect_failure_tags(result.trace_path)
+            path_type = _extract_path_type(result.trace_path)
+            verifier_failures = _extract_verifier_failures(result.trace_path)
+            logger.info(
+                "eval.sample id=%s path=%s tools=%s verify_failures=%s score=%.2f",
+                sample_id,
+                path_type,
+                ",".join(result.tools_used),
+                ",".join(verifier_failures),
+                score.score,
+            )
+            if is_mcq:
+                normalized_pred = normalize_mcq_answer(result.answer or "")
+                normalized_exp = normalize_mcq_answer("" if expected is None else str(expected))
+                logger.info(
+                    "eval.mcq id=%s raw_predicted=%s normalized_predicted=%s raw_expected=%s normalized_expected=%s",
+                    sample_id,
+                    result.answer,
+                    normalized_pred,
+                    expected,
+                    normalized_exp,
+                )
             record = {
                 "id": sample_id,
                 "input": query,
@@ -111,8 +136,19 @@ def _score_sample(
     predicted: str,
     expected: Any,
     payload: dict[str, Any],
+    is_mcq: bool,
 ) -> ScoreResult:
     expected_str = "" if expected is None else str(expected)
+    if is_mcq:
+        normalized_pred = normalize_mcq_answer(predicted or "")
+        normalized_exp = normalize_mcq_answer(expected_str)
+        if not normalized_pred or not normalized_exp:
+            return ScoreResult(
+                score=0.0,
+                passed=False,
+                reason="MCQ normalization failed",
+            )
+        return score_exact(normalized_pred, normalized_exp)
     if args.scorer == "exact":
         return score_exact(predicted, expected_str)
     if args.scorer == "case_insensitive":
@@ -141,3 +177,54 @@ def _collect_failure_tags(trace_path: str | None) -> list[str]:
         if event.get("type") == "failure"
     ]
     return [tag for tag in failures if tag]
+
+
+def _is_mcq_sample(payload: dict[str, Any], expected: Any, query: str) -> bool:
+    if payload.get("type") == "mcq":
+        return True
+    if isinstance(payload.get("choices"), list) or isinstance(payload.get("options"), list):
+        return True
+    normalized_expected = normalize_mcq_answer("" if expected is None else str(expected))
+    if normalized_expected:
+        if any(token in query for token in ["A)", "B)", "C)", "D)", "E)"]):
+            return True
+        if any(token in query for token in ["A.", "B.", "C.", "D.", "E."]):
+            return True
+        if "option" in query.lower():
+            return True
+    return False
+
+
+def _extract_path_type(trace_path: str | None) -> str:
+    payload = _load_trace(trace_path)
+    if not payload:
+        return "unknown"
+    for event in payload.get("events", []):
+        if event.get("type") == "controller_path":
+            return event.get("payload", {}).get("path", "unknown")
+    return "unknown"
+
+
+def _extract_verifier_failures(trace_path: str | None) -> list[str]:
+    payload = _load_trace(trace_path)
+    if not payload:
+        return []
+    failures: list[str] = []
+    for event in payload.get("events", []):
+        if event.get("type") != "verifier":
+            continue
+        if event.get("payload", {}).get("ok") is False:
+            for failure in event.get("payload", {}).get("failures", []):
+                name = failure.get("check_name")
+                if name:
+                    failures.append(name)
+    return failures
+
+
+def _load_trace(trace_path: str | None) -> dict[str, Any] | None:
+    if not trace_path:
+        return None
+    path = Path(trace_path)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
