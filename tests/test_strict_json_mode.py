@@ -10,14 +10,18 @@ def test_strict_json_mode_repairs_prefix():
         scripted=[
             ModelResponse(
                 final_text='here is JSON: {"type":"final","answer":"ok","confidence":0.4,"checks":[]}'
-            )
+            ),
+            ModelResponse(final_text='{"type":"final","answer":"step2","confidence":0.4,"checks":[]}'),
+            ModelResponse(final_text='{"type":"final","answer":"ok","confidence":0.4,"checks":[]}'),
         ]
     )
     agent = Agent(
         model=model,
         registry=ToolRegistry(),
-        policy=SafetyPolicy(max_model_calls=2),
+        policy=SafetyPolicy(max_model_calls=3),
         strict_json_mode=True,
+        profile="qa",
+        verify=False,
     )
     result = agent.run("hello")
     assert "ok" in result.answer
@@ -27,14 +31,18 @@ def test_strict_json_mode_format_retry_is_ephemeral():
     model = MockChatModel(
         scripted=[
             ModelResponse(final_text="not json at all"),
+            ModelResponse(final_text='{"type":"final","answer":"step1","confidence":0.4,"checks":[]}'),
+            ModelResponse(final_text='{"type":"final","answer":"step2","confidence":0.4,"checks":[]}'),
             ModelResponse(final_text='{"type":"final","answer":"ok","confidence":0.4,"checks":[]}'),
         ]
     )
     agent = Agent(
         model=model,
         registry=ToolRegistry(),
-        policy=SafetyPolicy(max_model_calls=3),
+        policy=SafetyPolicy(max_model_calls=5),
         strict_json_mode=True,
+        profile="qa",
+        verify=False,
     )
     result = agent.run("hello")
     assert "ok" in result.answer

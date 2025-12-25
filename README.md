@@ -79,6 +79,7 @@ Environment variables (CLI flags override env vars):
 - `TOKEN_CHAR_RATIO` (default `4`)
 - `MAX_TURNS` (default `20`)
 - `TRIM_STRATEGY` (default `drop_oldest`)
+- `BRANCH_CANDIDATES` (default `1`)
 - `STRICT_JSON_MODE` (default `false`)
 - `CODE_CHECK` (default `false`)
 - `CODE_CHECK_MAX_ITERS` (default `2`)
@@ -91,7 +92,7 @@ python -m agentforge "Question" --self-consistency 2 --verify --summary-lines 8 
 
 Additional CLI flags for small-model robustness:
 ```bash
-python -m agentforge "Write code" --strict-json --code-check --max-message-chars 24000 --max-turns 20
+python -m agentforge "Write code" --strict-json --code-check --max-message-chars 24000 --max-turns 20 --branch-candidates 2
 ```
 
 Strict JSON mode enforces a single JSON object response and retries once on format errors.

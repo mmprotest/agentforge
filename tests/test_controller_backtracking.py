@@ -7,15 +7,19 @@ from agentforge.tools.registry import ToolRegistry
 
 def test_controller_backtracks_on_repeated_failure():
     scripted = [
+        ModelResponse(final_text='{"type":"final","answer":"step1","confidence":0.2,"checks":[]}'),
         ModelResponse(final_text=""),
         ModelResponse(final_text=""),
-        ModelResponse(final_text="ok"),
+        ModelResponse(final_text='{"type":"final","answer":"step2","confidence":0.2,"checks":[]}'),
+        ModelResponse(final_text='{"type":"final","answer":"ok","confidence":0.2,"checks":[]}'),
     ]
     model = MockChatModel(scripted=scripted)
     agent = Agent(
         model=model,
         registry=ToolRegistry(),
         policy=SafetyPolicy(max_model_calls=5),
+        profile="qa",
+        verify=False,
     )
     result = agent.run("Provide a short response")
     assert "ok" in result.answer

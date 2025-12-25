@@ -26,6 +26,9 @@ class MemoryStore:
     state: dict[str, Any] = field(
         default_factory=lambda: {
             "facts": [],
+            "facts_structured": [],
+            "constraints": {},
+            "intermediates": {},
             "intermediate_results": [],
             "assumptions": [],
             "plan": None,

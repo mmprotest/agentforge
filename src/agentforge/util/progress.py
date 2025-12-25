@@ -13,6 +13,9 @@ class ProgressTracker:
     last_issue_count: int | None = None
     iterations_without_progress: int = 0
     last_fact_signature: str | None = None
+    last_structured_fact_count: int = 0
+    last_constraints_signature: str | None = None
+    last_intermediates_signature: str | None = None
 
     def update(
         self,
@@ -21,11 +24,29 @@ class ProgressTracker:
         verifier_ok: bool | None,
         issue_count: int | None,
         fact_signature: str | None = None,
+        structured_fact_count: int | None = None,
+        constraints_signature: str | None = None,
+        intermediates_signature: str | None = None,
     ) -> bool:
         progress = False
         if fact_count > self.last_fact_count:
             progress = True
         if fact_signature is not None and fact_signature != self.last_fact_signature:
+            progress = True
+        if (
+            structured_fact_count is not None
+            and structured_fact_count > self.last_structured_fact_count
+        ):
+            progress = True
+        if (
+            constraints_signature is not None
+            and constraints_signature != self.last_constraints_signature
+        ):
+            progress = True
+        if (
+            intermediates_signature is not None
+            and intermediates_signature != self.last_intermediates_signature
+        ):
             progress = True
         if tool_count > self.last_tool_handle_count:
             progress = True
@@ -43,6 +64,12 @@ class ProgressTracker:
         self.last_verifier_ok = verifier_ok
         self.last_issue_count = issue_count
         self.last_fact_signature = fact_signature
+        if structured_fact_count is not None:
+            self.last_structured_fact_count = structured_fact_count
+        if constraints_signature is not None:
+            self.last_constraints_signature = constraints_signature
+        if intermediates_signature is not None:
+            self.last_intermediates_signature = intermediates_signature
         return progress
 
     def reset(self) -> None:
@@ -56,6 +83,9 @@ class ProgressTracker:
             "last_issue_count": self.last_issue_count,
             "iterations_without_progress": self.iterations_without_progress,
             "last_fact_signature": self.last_fact_signature,
+            "last_structured_fact_count": self.last_structured_fact_count,
+            "last_constraints_signature": self.last_constraints_signature,
+            "last_intermediates_signature": self.last_intermediates_signature,
         }
 
     @classmethod
@@ -67,4 +97,7 @@ class ProgressTracker:
             last_issue_count=payload.get("last_issue_count"),
             iterations_without_progress=int(payload.get("iterations_without_progress", 0)),
             last_fact_signature=payload.get("last_fact_signature"),
+            last_structured_fact_count=int(payload.get("last_structured_fact_count", 0)),
+            last_constraints_signature=payload.get("last_constraints_signature"),
+            last_intermediates_signature=payload.get("last_intermediates_signature"),
         )

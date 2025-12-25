@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from fractions import Fraction
+import math
 from typing import Any, Callable
 
 from agentforge.tasks import CheckSpec, MicroTask
@@ -230,10 +232,30 @@ class Verifier:
         output, ok = self.tool_runner(tool_name, tool_args)
         if not ok:
             return [f"Tool recompute failed for {tool_name}"]
-        if isinstance(candidate_output, (dict, list)):
+        compare = str(check.params.get("compare") or "smart").lower()
+        direction = str(check.params.get("subset_direction") or "expected_in_actual").lower()
+        if compare == "exact":
             if candidate_output != output:
                 return ["Tool recompute output did not match"]
             return []
+        if compare == "numeric":
+            return [] if numeric_close(candidate_output, output) else ["Tool recompute output did not match"]
+        if compare == "text":
+            return [] if normalize_text(candidate_output) == normalize_text(output) else [
+                "Tool recompute output did not match"
+            ]
+        if compare == "subset":
+            return [] if dict_subset_compare(candidate_output, output, direction) else [
+                "Tool recompute output did not match"
+            ]
+        if numeric_close(candidate_output, output):
+            return []
+        if isinstance(candidate_output, str) and isinstance(output, str):
+            if normalize_text(candidate_output) == normalize_text(output):
+                return []
+        if isinstance(candidate_output, dict) and isinstance(output, dict):
+            if candidate_output == output:
+                return []
         if str(candidate_output).strip() != str(output).strip():
             return ["Tool recompute output did not match"]
         return []
@@ -299,3 +321,59 @@ class Verifier:
                 file_path = f"snippet_{idx}.py"
             files[file_path] = "\n".join(lines).strip() + "\n"
         return files
+
+
+def normalize_text(value: Any) -> str:
+    text = str(value or "")
+    return " ".join(text.strip().split())
+
+
+def try_parse_number(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, Fraction):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"-?\d+/\d+", text):
+        try:
+            return float(Fraction(text))
+        except (ZeroDivisionError, ValueError):
+            return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def numeric_close(a: Any, b: Any, rel: float = 1e-6, abs: float = 1e-9) -> bool:
+    first = try_parse_number(a)
+    second = try_parse_number(b)
+    if first is None or second is None:
+        return False
+    return math.isclose(first, second, rel_tol=rel, abs_tol=abs)
+
+
+def dict_subset(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
+    for key, value in expected.items():
+        if key not in actual:
+            return False
+        actual_value = actual[key]
+        if isinstance(value, dict) and isinstance(actual_value, dict):
+            if not dict_subset(value, actual_value):
+                return False
+        else:
+            if value != actual_value:
+                return False
+    return True
+
+
+def dict_subset_compare(
+    candidate_output: Any, output: Any, direction: str
+) -> bool:
+    if not isinstance(candidate_output, dict) or not isinstance(output, dict):
+        return False
+    if direction == "actual_in_expected":
+        return dict_subset(output, candidate_output)
+    return dict_subset(candidate_output, output)

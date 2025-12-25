@@ -12,7 +12,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from agentforge.controller import ActionType, Controller
-from agentforge.models.base import BaseChatModel
+from agentforge.models.base import BaseChatModel, ModelResponse
 from agentforge.protocol import (
     ProtocolFinal,
     ProtocolToolCall,
@@ -32,7 +32,7 @@ from agentforge.tools.base import Tool
 from agentforge.tools.builtins.deep_think import DeepThinkTool
 from agentforge.tools.registry import ToolRegistry
 from agentforge.util.context_trim import trim_messages
-from agentforge.util.fact_extract import extract_facts
+from agentforge.util.fact_extract import extract_facts, extract_facts_structured
 from agentforge.util.json_repair import JsonRepairError, repair_json
 from agentforge.util.progress import ProgressTracker
 from agentforge.verifier import Verifier
@@ -72,6 +72,7 @@ class Agent:
         code_check: bool | None = None,
         code_check_max_iters: int | None = None,
         profile: str | None = None,
+        branch_candidates: int = 1,
     ) -> None:
         self.model = model
         self.registry = registry
@@ -93,6 +94,7 @@ class Agent:
         self.code_check_max_iters = code_check_max_iters
         self.profile_name = profile or "agent"
         self.profile_explicit = profile is not None
+        self.branch_candidates = max(1, min(int(branch_candidates), 3))
         self.tools_used: list[str] = []
         self.tools_created: list[str] = []
         self._model_calls = 0
@@ -256,6 +258,9 @@ class Agent:
                 "last_tool_facts": [],
             }
         )
+        state.memory_state.setdefault("facts_structured", [])
+        state.memory_state.setdefault("constraints", self._extract_constraints_from_query(query))
+        state.memory_state.setdefault("intermediates", {})
         last_parse_failed: str | None = None
         retry_instruction: dict[str, Any] | None = None
         format_retry_message: dict[str, Any] | None = None
@@ -330,16 +335,15 @@ class Agent:
                 retry_instruction = None
                 format_retry_message = None
                 tools = self.registry.openai_schemas()
-                response = self.model.chat(call_messages, tools=tools)
-                self._model_calls += 1
-                state.budgets.model_calls -= 1
-                if self.trace:
-                    tool_payload = (
-                        response.tool_call.model_dump()
-                        if response.tool_call is not None
-                        else None
-                    )
-                    self.trace.record_model_response(response.final_text, tool_payload)
+                current_task = state.task_graph.current_task
+                response = self._run_model_candidates(
+                    call_messages,
+                    tools,
+                    state,
+                    current_task,
+                    verifier,
+                    strict_json_mode,
+                )
                 protocol = None
                 if response.final_text:
                     protocol = self._parse_model_protocol(response.final_text)
@@ -370,7 +374,6 @@ class Agent:
                     response = response.model_copy(
                         update={"tool_call": protocol_to_toolcall(protocol)}
                     )
-                current_task = state.task_graph.current_task
                 if response.final_text is not None and isinstance(protocol, ProtocolFinal):
                     answer = format_final(protocol.answer, protocol.checks)
                     if code_check_enabled:
@@ -562,9 +565,15 @@ class Agent:
                 or "Revise the output to address verification issues.",
             }
             state.memory_state["needs_revision"] = True
+            constraints = state.memory_state.setdefault("constraints", {})
+            if isinstance(constraints, dict):
+                constraints["verifier_issues"] = result.issues
         else:
             state.last_error = None
             state.memory_state["needs_revision"] = False
+            constraints = state.memory_state.get("constraints")
+            if isinstance(constraints, dict):
+                constraints.pop("verifier_issues", None)
         state.memory_state["verifier_failures"] = failures
         if self.trace:
             self.trace.record(
@@ -587,11 +596,52 @@ class Agent:
         facts = state.memory_state.get("facts")
         fact_count = len(facts) if isinstance(facts, list) else 0
         fact_signature = "|".join(facts) if isinstance(facts, list) else ""
+        structured_facts = state.memory_state.get("facts_structured")
+        structured_count = len(structured_facts) if isinstance(structured_facts, list) else 0
+        constraints = state.memory_state.get("constraints")
+        constraints_signature = (
+            json.dumps(constraints, sort_keys=True)
+            if isinstance(constraints, dict)
+            else None
+        )
+        intermediates = state.memory_state.get("intermediates")
+        intermediates_signature = (
+            "|".join(sorted(intermediates.keys()))
+            if isinstance(intermediates, dict)
+            else None
+        )
         tool_count = len(self.memory.entries)
         issue_count = len(result.issues) if result else None
         state.progress.update(
-            fact_count, tool_count, result.ok, issue_count, fact_signature=fact_signature
+            fact_count,
+            tool_count,
+            result.ok,
+            issue_count,
+            fact_signature=fact_signature,
+            structured_fact_count=structured_count,
+            constraints_signature=constraints_signature,
+            intermediates_signature=intermediates_signature,
         )
+
+    def _extract_constraints_from_query(self, query: str) -> dict[str, Any]:
+        requirements: list[str] = []
+        prohibitions: list[str] = []
+        sentences = re.split(r"[.!?]\s+", query)
+        for sentence in sentences:
+            text = sentence.strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            if any(token in lowered for token in ["must", "should", "need to", "required"]):
+                requirements.append(text)
+            if any(token in lowered for token in ["do not", "don't", "avoid", "never"]):
+                prohibitions.append(text)
+        constraints: dict[str, Any] = {}
+        if requirements:
+            constraints["requirements"] = requirements[:8]
+        if prohibitions:
+            constraints["prohibitions"] = prohibitions[:8]
+        return constraints
 
     def _apply_backtrack(self, state: AgentState, reason: str) -> None:
         state.budgets.backtracks = max(0, state.budgets.backtracks - 1)
@@ -743,6 +793,144 @@ class Agent:
                 }
         return None
 
+    def _run_model_candidates(
+        self,
+        call_messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        state: AgentState,
+        current_task: MicroTask | None,
+        verifier: Verifier,
+        strict_json_mode: bool,
+    ):
+        if (
+            self.branch_candidates <= 1
+            or current_task is None
+            or not self._is_objective_check(current_task.check)
+            or current_task.tool_hint
+        ):
+            return self._call_model(call_messages, tools, state)
+        available = min(state.budgets.model_calls, self.max_model_calls - self._model_calls)
+        effective_k = max(1, min(self.branch_candidates, available, 3))
+        if effective_k <= 1:
+            return self._call_model(call_messages, tools, state)
+        candidates: list[dict[str, Any]] = []
+        responses = []
+        for idx in range(effective_k):
+            label = chr(ord("A") + idx)
+            response = self._call_model(
+                call_messages,
+                tools,
+                state,
+                extra_system_message=f"Draft {label}",
+            )
+            ok, issues = self._evaluate_candidate_response(
+                response,
+                current_task,
+                verifier,
+                strict_json_mode,
+                state,
+            )
+            candidates.append({"label": label, "ok": ok, "issues": issues})
+            responses.append(response)
+        selected_index = self._select_candidate_index(candidates)
+        if self.trace:
+            self.trace.record(
+                "branch_select",
+                {
+                    "task_id": current_task.id,
+                    "selected": candidates[selected_index]["label"],
+                    "candidates": [
+                        {
+                            "label": candidate["label"],
+                            "ok": candidate["ok"],
+                            "issues": candidate["issues"][:3],
+                        }
+                        for candidate in candidates
+                    ],
+                },
+            )
+        return responses[selected_index]
+
+    def _call_model(
+        self,
+        call_messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        state: AgentState,
+        extra_system_message: str | None = None,
+    ):
+        messages = list(call_messages)
+        if extra_system_message:
+            messages.append({"role": "system", "content": extra_system_message})
+        if self._model_calls >= self.max_model_calls or state.budgets.model_calls <= 0:
+            return ModelResponse(final_text=None)
+        response = self.model.chat(messages, tools=tools)
+        self._model_calls += 1
+        state.budgets.model_calls -= 1
+        if self.trace:
+            tool_payload = (
+                response.tool_call.model_dump()
+                if response.tool_call is not None
+                else None
+            )
+            self.trace.record_model_response(response.final_text, tool_payload)
+        return response
+
+    def _select_candidate_index(self, candidates: list[dict[str, Any]]) -> int:
+        scored = []
+        for idx, candidate in enumerate(candidates):
+            ok = candidate["ok"]
+            issues = candidate["issues"] or []
+            scored.append((0 if ok else 1, len(issues), idx))
+        scored.sort()
+        return scored[0][2]
+
+    def _evaluate_candidate_response(
+        self,
+        response,
+        task: MicroTask,
+        verifier: Verifier,
+        strict_json_mode: bool,
+        state: AgentState,
+    ) -> tuple[bool, list[str]]:
+        if response.tool_call is not None and response.final_text is None:
+            return False, ["Model returned a tool call"]
+        if response.final_text is None:
+            return False, ["No candidate output"]
+        protocol = self._parse_model_protocol(response.final_text)
+        if protocol is None and strict_json_mode:
+            return False, ["Output is not valid JSON"]
+        if isinstance(protocol, ProtocolFinal):
+            candidate_output = format_final(protocol.answer, protocol.checks)
+        else:
+            candidate_output = response.final_text
+        candidate_for_check = self._coerce_candidate_for_check(task, candidate_output)
+        check_task = task
+        if check_task.check.type == "code_run":
+            check_task = self._attach_code_source(check_task, candidate_output)
+        check_task = self._attach_tool_error_absent(check_task, state)
+        if check_task.check.type == "tool_recompute":
+            check_task = self._attach_tool_recompute(check_task, state)
+        result = verifier.verify(candidate_for_check, check_task)
+        return result.ok, result.issues
+
+    def _is_objective_check(self, check: CheckSpec) -> bool:
+        objective_predicates = {
+            "non_empty",
+            "looks_numeric",
+            "numeric_range",
+            "contains_fields",
+            "unit_present",
+        }
+        if check.type in {"schema", "contains_fields", "regex", "tool_recompute", "code_run"}:
+            return True
+        if check.type == "predicate":
+            return check.params.get("name") in objective_predicates
+        if check.all_of:
+            return any(self._is_objective_check(sub) for sub in check.all_of)
+        if check.any_of:
+            return any(self._is_objective_check(sub) for sub in check.any_of)
+        return False
+
     def _build_contract_message(
         self,
         state: AgentState,
@@ -754,6 +942,7 @@ class Agent:
         current_task = state.task_graph.current_task
         if current_task is None:
             return None
+        contract_payload = self._build_contract_payload(current_task, state)
         parts: list[str] = []
         parts.append("Microtask contract:")
         parts.append(f"- Goal: {current_task.goal}")
@@ -778,10 +967,102 @@ class Agent:
             parts.append(f"- Tool retry: {retry_instruction['content']}")
         if format_retry_message and format_retry_message.get("content"):
             parts.append(f"- Format retry: {format_retry_message['content']}")
+        parts.append("CONTRACT_JSON:")
+        parts.append(json.dumps(contract_payload, ensure_ascii=False))
         content = "\n".join(parts)
-        if len(content) > 800:
-            content = content[:797] + "..."
+        if len(content) > 1200:
+            content = self._trim_contract_content(content, contract_payload, parts)
         return {"role": "user", "content": content}
+
+    def _build_contract_payload(
+        self,
+        task: MicroTask,
+        state: AgentState,
+    ) -> dict[str, Any]:
+        required_fields = self._extract_required_fields(task.check)
+        expected_type = "tool" if task.tool_hint else "final"
+        payload = {
+            "task_id": task.id,
+            "goal": self._truncate_text(task.goal, 240),
+            "expected_output": {
+                "type": expected_type,
+                "required_fields": required_fields,
+            },
+            "check": self._truncate_check(task.check),
+            "tool_hint": self._truncate_text(task.tool_hint or "", 160),
+            "stop_when": "verifier_ok",
+        }
+        if state.last_error and state.last_error.get("issues"):
+            payload["verifier_issues"] = state.last_error.get("issues")[:3]
+        return payload
+
+    def _extract_required_fields(self, check: CheckSpec) -> list[str]:
+        fields: list[str] = []
+        if check.type == "contains_fields":
+            fields.extend(check.params.get("required_fields") or [])
+        elif check.type == "json_protocol":
+            fields.extend(check.params.get("required_keys") or ["answer"])
+        if check.all_of:
+            for sub in check.all_of:
+                fields.extend(self._extract_required_fields(sub))
+        if check.any_of:
+            for sub in check.any_of:
+                fields.extend(self._extract_required_fields(sub))
+        return list(dict.fromkeys(fields))
+
+    def _truncate_check(self, check: CheckSpec) -> dict[str, Any]:
+        payload = check.model_dump()
+        return self._truncate_payload(payload, max_str_len=160, max_list_items=4, max_depth=3)
+
+    def _truncate_payload(
+        self,
+        payload: Any,
+        max_str_len: int,
+        max_list_items: int,
+        max_depth: int,
+    ) -> Any:
+        if max_depth <= 0:
+            return payload
+        if isinstance(payload, dict):
+            return {
+                key: self._truncate_payload(value, max_str_len, max_list_items, max_depth - 1)
+                for key, value in payload.items()
+            }
+        if isinstance(payload, list):
+            trimmed = payload[:max_list_items]
+            return [
+                self._truncate_payload(item, max_str_len, max_list_items, max_depth - 1)
+                for item in trimmed
+            ]
+        if isinstance(payload, str):
+            return self._truncate_text(payload, max_str_len)
+        return payload
+
+    def _truncate_text(self, text: str, max_len: int) -> str:
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 3] + "..."
+
+    def _trim_contract_content(
+        self,
+        content: str,
+        contract_payload: dict[str, Any],
+        parts: list[str],
+    ) -> str:
+        payload = dict(contract_payload)
+        payload["goal"] = self._truncate_text(str(payload.get("goal") or ""), 120)
+        payload["tool_hint"] = self._truncate_text(str(payload.get("tool_hint") or ""), 80)
+        payload["check"] = {"type": payload.get("check", {}).get("type")}
+        parts = parts[:-1] + [json.dumps(payload, ensure_ascii=False)]
+        trimmed = "\n".join(parts)
+        if len(trimmed) > 1200:
+            minimal_parts = [
+                "Microtask contract:",
+                "CONTRACT_JSON:",
+                json.dumps(payload, ensure_ascii=False),
+            ]
+            trimmed = "\n".join(minimal_parts)
+        return trimmed
 
     def _describe_check(self, check: "CheckSpec") -> str:
         if check.all_of:
@@ -826,30 +1107,74 @@ class Agent:
     def _coerce_candidate_for_check(self, task: MicroTask, candidate: Any) -> Any:
         if candidate is None:
             return candidate
-        if task.goal.lower().startswith("final") and self._check_includes_type(
-            task.check, "contains_fields"
-        ):
-            if not isinstance(candidate, dict):
+        if not isinstance(candidate, dict):
+            required_fields = self._extract_required_fields(task.check)
+            if "answer" in required_fields:
                 return {"answer": str(candidate)}
         return candidate
 
     def _update_facts_from_tool(
         self, tool_name: str, output: Any, summary_text: str
     ) -> None:
-        facts = extract_facts(tool_name, output, summary_text)
+        handle = self.memory.entries[-1].handle if self.memory.entries else None
+        facts = extract_facts(tool_name, output, summary_text, source=handle)
+        structured = extract_facts_structured(
+            tool_name, output, summary_text, source=handle
+        )
         if not facts:
             self.memory.state["last_tool_facts"] = []
-            return
-        fact_store = self.memory.state.setdefault("facts", [])
-        if not isinstance(fact_store, list):
-            fact_store = []
-            self.memory.state["facts"] = fact_store
-        existing = set(fact_store)
-        for fact in facts:
-            if fact not in existing:
-                fact_store.append(fact)
-                existing.add(fact)
-        self.memory.state["last_tool_facts"] = facts
+        else:
+            fact_store = self.memory.state.setdefault("facts", [])
+            if not isinstance(fact_store, list):
+                fact_store = []
+                self.memory.state["facts"] = fact_store
+            existing = set(fact_store)
+            for fact in facts:
+                if fact not in existing:
+                    fact_store.append(fact)
+                    existing.add(fact)
+            self.memory.state["last_tool_facts"] = facts
+        if structured:
+            structured_store = self.memory.state.setdefault("facts_structured", [])
+            if not isinstance(structured_store, list):
+                structured_store = []
+                self.memory.state["facts_structured"] = structured_store
+            existing_structured = {
+                (item.get("kind"), item.get("value")) for item in structured_store
+            }
+            for item in structured:
+                key = (item.get("kind"), item.get("value"))
+                if key in existing_structured:
+                    continue
+                structured_store.append(item)
+                existing_structured.add(key)
+            self.memory.state["last_tool_facts_structured"] = structured
+        self._update_intermediates_from_facts(structured)
+
+    def _update_intermediates_from_facts(
+        self, structured: list[dict[str, Any]]
+    ) -> None:
+        intermediates = self.memory.state.setdefault("intermediates", {})
+        if not isinstance(intermediates, dict):
+            intermediates = {}
+            self.memory.state["intermediates"] = intermediates
+        index = 0
+        for fact in structured:
+            kind = fact.get("kind")
+            value = fact.get("value")
+            if not isinstance(value, str):
+                continue
+            if kind == "kv" and ":" in value:
+                key, val = value.split(":", 1)
+                key = key.strip()
+                val = val.strip()
+                if key and key not in intermediates:
+                    intermediates[key] = val
+            elif kind == "number":
+                key = f"number_{index}"
+                if key not in intermediates:
+                    intermediates[key] = value
+                    index += 1
 
     def _pick_best(self, candidates: list[AgentResult]) -> AgentResult:
         def score(candidate: AgentResult) -> tuple[float, int, int]:

@@ -31,6 +31,15 @@ def test_contract_injected_ephemeral():
         "Microtask contract:" in str(msg.get("content", ""))
         for msg in model.last_messages
     )
+    contract_messages = [
+        msg for msg in model.last_messages if "CONTRACT_JSON:" in str(msg.get("content", ""))
+    ]
+    assert contract_messages
+    contract_content = str(contract_messages[-1].get("content", ""))
+    json_block = contract_content.split("CONTRACT_JSON:", 1)[-1].strip()
+    payload = json.loads(json_block)
+    assert payload["task_id"]
+    assert payload["stop_when"] == "verifier_ok"
     assert all(
         "Microtask contract:" not in str(msg.get("content", ""))
         for msg in agent._messages
