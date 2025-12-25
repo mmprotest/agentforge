@@ -11,14 +11,19 @@ class CheckSpec(BaseModel):
     """Specification for verifying a microtask output."""
 
     type: Literal[
+        "contains_fields",
+        "json_protocol",
         "schema",
         "regex",
         "predicate",
         "tool_recompute",
         "code_run",
+        "tool_error_absent",
         "none",
     ]
     params: dict[str, Any] = Field(default_factory=dict)
+    all_of: list["CheckSpec"] | None = None
+    any_of: list["CheckSpec"] | None = None
 
 
 class MicroTask(BaseModel):

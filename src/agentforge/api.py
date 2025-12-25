@@ -99,7 +99,7 @@ async def run_agent(request: RunRequest) -> RunResponse:
         settings.openai_model = request.model
     if request.mode:
         settings.agent_mode = request.mode
-    profile = request.profile or "agent"
+    profile = request.profile
     if request.allow_tool_creation is not None:
         settings.allow_tool_creation = request.allow_tool_creation
     if request.summary_lines is not None:
@@ -132,20 +132,32 @@ async def run_agent(request: RunRequest) -> RunResponse:
         registry=registry,
         policy=policy,
         mode=settings.agent_mode,
-        verify=bool(request.verify),
+        verify=request.verify,
         self_consistency=request.self_consistency or 1,
         max_model_calls=settings.max_model_calls,
         memory=memory,
         trace=trace,
-        strict_json_mode=settings.strict_json_mode,
+        strict_json_mode=(
+            request.strict_json
+            if request.strict_json is not None
+            else (True if settings.strict_json_mode else None)
+        ),
         max_message_chars=settings.max_message_chars,
         max_message_tokens_approx=settings.max_message_tokens_approx,
         token_char_ratio=settings.token_char_ratio,
         max_single_message_chars=settings.max_single_message_chars,
         max_turns=settings.max_turns,
         trim_strategy=settings.trim_strategy,
-        code_check=settings.code_check,
-        code_check_max_iters=settings.code_check_max_iters,
+        code_check=(
+            request.code_check
+            if request.code_check is not None
+            else (True if settings.code_check else None)
+        ),
+        code_check_max_iters=(
+            request.code_check_max_iters
+            if request.code_check_max_iters is not None
+            else (settings.code_check_max_iters if settings.code_check_max_iters != 2 else None)
+        ),
         profile=profile,
     )
     result = agent.run(request.query)
