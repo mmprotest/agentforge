@@ -12,6 +12,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from agentforge.controller import ActionType, Controller
+from agentforge.failures import FailureEvent, FailureTag, verifier_failure_tag
 from agentforge.models.base import BaseChatModel, ModelResponse
 from agentforge.protocol import (
     ProtocolFinal,
@@ -73,6 +74,7 @@ class Agent:
         code_check_max_iters: int | None = None,
         profile: str | None = None,
         branch_candidates: int = 1,
+        eval_mode: bool = False,
     ) -> None:
         self.model = model
         self.registry = registry
@@ -95,6 +97,7 @@ class Agent:
         self.profile_name = profile or "agent"
         self.profile_explicit = profile is not None
         self.branch_candidates = max(1, min(int(branch_candidates), 3))
+        self.eval_mode = bool(eval_mode)
         self.tools_used: list[str] = []
         self.tools_created: list[str] = []
         self._model_calls = 0
@@ -144,6 +147,8 @@ class Agent:
     def run(self, query: str) -> AgentResult:
         profile = get_profile(self.profile_name)
         verify_enabled = profile.verify_default if self.verify is None else self.verify
+        if self.eval_mode:
+            verify_enabled = True
         if self.self_consistency > 1:
             candidates: list[AgentResult] = []
             for index in range(self.self_consistency):
@@ -180,6 +185,8 @@ class Agent:
         self._messages = []
         profile = get_profile(self.profile_name)
         strict_json_mode = profile.strict_json_default if self.strict_json_mode is None else self.strict_json_mode
+        if self.eval_mode:
+            strict_json_mode = True
         self.strict_json_mode = strict_json_mode
         effective_code_check_max_iters = (
             profile.code_check_max_iters_default
@@ -192,8 +199,8 @@ class Agent:
             "Use tools when necessary. "
             "Respond with JSON only, using either "
             '{"type":"tool","name":"<tool>","arguments":{...}} '
-            'or {"type":"final","answer":"...","confidence":0.0,"checks":[...]} '
-            "Do not reveal chain-of-thought."
+            'or {"type":"final","answer":"...","scratchpad":"...","confidence":0.0,"checks":[...]} '
+            "Do not reveal chain-of-thought. Scratchpad is hidden from users."
         )
         if strict_json_mode:
             system_prompt += (
@@ -248,6 +255,8 @@ class Agent:
                 "pending_verification": False,
                 "verifier_failures": {},
                 "tool_error_counts": {},
+                "route_penalties": {},
+                "last_routed_tool": None,
                 "backtrack_count": 0,
                 "draft_answer": None,
                 "final_answer": None,
@@ -256,6 +265,7 @@ class Agent:
                 "tool_handles": [],
                 "tool_handle_count": 0,
                 "last_tool_facts": [],
+                "scratchpad": None,
             }
         )
         state.memory_state.setdefault("facts_structured", [])
@@ -275,6 +285,7 @@ class Agent:
                     state.memory_state["pending_verification"] = True
                     continue
                 tool_name = action.tool_name or ""
+                state.memory_state["last_routed_tool"] = tool_name
                 direct_args = action.tool_args or self._direct_tool_args(
                     tool_name, query, last_parse_failed
                 )
@@ -287,6 +298,13 @@ class Agent:
                     continue
                 tool = self.registry.get(tool_name)
                 if tool is None:
+                    self._record_failure(
+                        FailureEvent(
+                            tag=FailureTag.TOOL_ERROR.value,
+                            reason="Requested unknown tool",
+                            details={"tool_name": tool_name},
+                        )
+                    )
                     return AgentResult(
                         answer=f"Requested unknown tool: {tool_name}",
                         tools_used=self.tools_used,
@@ -294,6 +312,13 @@ class Agent:
                         trace_path=self._finalize_trace(),
                     )
                 if not self.policy.is_tool_allowed(tool_name):
+                    self._record_failure(
+                        FailureEvent(
+                            tag=FailureTag.TOOL_ERROR.value,
+                            reason="Tool not allowed",
+                            details={"tool_name": tool_name},
+                        )
+                    )
                     return AgentResult(
                         answer=f"Tool not allowed: {tool_name}",
                         tools_used=self.tools_used,
@@ -322,6 +347,7 @@ class Agent:
                 if state.budgets.model_calls <= 0:
                     state.memory_state["pending_verification"] = True
                     continue
+                state.memory_state["last_routed_tool"] = None
                 call_messages = list(self._messages)
                 contract_message = self._build_contract_message(
                     state,
@@ -362,6 +388,13 @@ class Agent:
                             last_parse_failed = response.final_text
                             continue
                         last_parse_failed = response.final_text
+                        self._record_failure(
+                            FailureEvent(
+                                tag=FailureTag.FORMAT_VIOLATION.value,
+                                reason="Strict JSON output required",
+                                details={"output": response.final_text[:200]},
+                            )
+                        )
                         return AgentResult(
                             answer="Could not parse the model output as JSON.",
                             tools_used=self.tools_used,
@@ -375,7 +408,11 @@ class Agent:
                         update={"tool_call": protocol_to_toolcall(protocol)}
                     )
                 if response.final_text is not None and isinstance(protocol, ProtocolFinal):
-                    answer = format_final(protocol.answer, protocol.checks)
+                    answer = format_final(protocol.answer, protocol.checks, eval_mode=self.eval_mode)
+                    if protocol.scratchpad:
+                        state.memory_state["scratchpad"] = protocol.scratchpad
+                        if self.trace:
+                            self.trace.record("scratchpad", {"content": protocol.scratchpad})
                     if code_check_enabled:
                         state.memory_state["draft_answer"] = answer
                     state.memory_state["candidate_output"] = answer
@@ -397,6 +434,12 @@ class Agent:
                         state.memory_state["final_answer"] = answer
                     continue
                 if response.tool_call is None:
+                    self._record_failure(
+                        FailureEvent(
+                            tag=FailureTag.PARSE_ERROR.value,
+                            reason="No response from model",
+                        )
+                    )
                     return AgentResult(
                         answer="No response from model",
                         tools_used=self.tools_used,
@@ -406,6 +449,13 @@ class Agent:
                 tool_name = response.tool_call.name
                 tool = self.registry.get(tool_name)
                 if tool is None:
+                    self._record_failure(
+                        FailureEvent(
+                            tag=FailureTag.TOOL_ERROR.value,
+                            reason="Requested unknown tool",
+                            details={"tool_name": tool_name},
+                        )
+                    )
                     return AgentResult(
                         answer=f"Requested unknown tool: {tool_name}",
                         tools_used=self.tools_used,
@@ -413,6 +463,13 @@ class Agent:
                         trace_path=self._finalize_trace(),
                     )
                 if not self.policy.is_tool_allowed(tool_name):
+                    self._record_failure(
+                        FailureEvent(
+                            tag=FailureTag.TOOL_ERROR.value,
+                            reason="Tool not allowed",
+                            details={"tool_name": tool_name},
+                        )
+                    )
                     return AgentResult(
                         answer=f"Tool not allowed: {tool_name}",
                         tools_used=self.tools_used,
@@ -449,29 +506,33 @@ class Agent:
                 candidate_for_check = self._coerce_candidate_for_check(
                     current_task, candidate
                 )
-                if current_task.check.type == "code_run":
+                if self._check_includes_type(current_task.check, "code_run"):
                     source_key = current_task.inputs.get("source_key")
                     if candidate is None and source_key:
                         candidate = state.memory_state.get(source_key)
                     if source_key:
                         current_task = self._attach_code_source(current_task, candidate)
                 current_task = self._attach_tool_error_absent(current_task, state)
-                if current_task.check.type == "tool_recompute":
+                if self._check_includes_type(current_task.check, "tool_recompute"):
                     current_task = self._attach_tool_recompute(current_task, state)
                 result = verifier.verify(candidate_for_check, current_task)
                 state.budgets.verifies -= 1
                 state.memory_state["pending_verification"] = False
                 self._record_verifier_result(state, current_task, result)
-                if result.ok:
+                if result.passed:
                     state.task_graph.mark_done(current_task.id)
                     if current_task.goal.lower().startswith("draft"):
                         state.memory_state["draft_answer"] = candidate
-                    if current_task.check.type == "code_run":
+                    if self._check_includes_type(current_task.check, "code_run"):
                         state.memory_state["draft_answer"] = candidate
                     if current_task.goal.lower().startswith("final"):
                         state.memory_state["final_answer"] = candidate
                 else:
                     state.task_graph.record_attempt(current_task.id)
+                    if current_task.attempts >= current_task.max_attempts:
+                        state.task_graph.mark_failed(
+                            current_task.id, notes="Max attempts exceeded"
+                        )
                 self._update_progress(state, result)
                 continue
             if action.type == ActionType.BACKTRACK:
@@ -483,9 +544,16 @@ class Agent:
                     answer = state.memory_state["candidate_output"]
                 if not answer:
                     answer = "No response from model"
+                if action.reason == "budget exhausted":
+                    self._record_failure(
+                        FailureEvent(
+                            tag=FailureTag.BUDGET_EXHAUSTED.value,
+                            reason="Budget exhausted before completion",
+                        )
+                    )
                 self._last_state = state
                 return AgentResult(
-                    answer=str(answer),
+                    answer=str(answer).rstrip() if self.eval_mode else str(answer),
                     tools_used=self.tools_used,
                     tools_created=self.tools_created,
                     checks=state.memory_state.get("candidate_checks", []),
@@ -493,6 +561,12 @@ class Agent:
                     trace_path=self._finalize_trace(),
                 )
         self._last_state = state
+        self._record_failure(
+            FailureEvent(
+                tag=FailureTag.BUDGET_EXHAUSTED.value,
+                reason="Reached iteration limit",
+            )
+        )
         return AgentResult(
             answer="Reached iteration limit",
             tools_used=self.tools_used,
@@ -547,48 +621,113 @@ class Agent:
         counts = state.memory_state.get("tool_error_counts", {})
         counts[tool_name] = counts.get(tool_name, 0) + 1
         state.memory_state["tool_error_counts"] = counts
+        penalties = state.memory_state.get("route_penalties", {})
+        penalties[tool_name] = penalties.get(tool_name, 0) + 1
+        state.memory_state["route_penalties"] = penalties
         state.last_error = {
             "error": f"Tool error from {tool_name}",
             "suggested_fix": "Adjust arguments or try an alternative tool.",
         }
+        self._record_failure(
+            FailureEvent(
+                tag=FailureTag.TOOL_ERROR.value,
+                reason=f"Tool error from {tool_name}",
+                details={"tool_name": tool_name},
+            )
+        )
+        if state.memory_state.get("last_routed_tool") == tool_name:
+            self._record_failure(
+                FailureEvent(
+                    tag=FailureTag.ROUTER_MISFIRE.value,
+                    reason="Router selected a tool that failed",
+                    details={"tool_name": tool_name},
+                )
+            )
+
+    def _record_failure(self, failure: FailureEvent) -> None:
+        if not self.trace:
+            return
+        payload = {"tag": failure.tag, "reason": failure.reason}
+        if failure.details:
+            payload["details"] = failure.details
+        self.trace.record("failure", payload)
 
     def _record_verifier_result(
         self, state: AgentState, task: MicroTask, result: "VerifierResult"
     ) -> None:
         failures = state.memory_state.get("verifier_failures", {})
-        if not result.ok:
+        if not result.passed:
             failures[task.id] = failures.get(task.id, 0) + 1
+            failure_payload = [
+                {
+                    "check_name": failure.check_name,
+                    "reason": failure.reason,
+                    "expected": failure.expected,
+                    "got": failure.got,
+                    "minimal_fix": failure.minimal_fix,
+                }
+                for failure in result.failures
+            ]
             state.last_error = {
                 "error": "Verification failed",
-                "issues": result.issues,
-                "suggested_fix": result.suggested_fix
-                or "Revise the output to address verification issues.",
+                "failures": failure_payload,
             }
             state.memory_state["needs_revision"] = True
             constraints = state.memory_state.setdefault("constraints", {})
             if isinstance(constraints, dict):
-                constraints["verifier_issues"] = result.issues
+                constraints["verifier_failures"] = failure_payload
+            if state.memory_state.get("candidate_source") == "tool":
+                tool_name = state.memory_state.get("last_tool_name") or "tool"
+                penalties = state.memory_state.get("route_penalties", {})
+                penalties[tool_name] = penalties.get(tool_name, 0) + 1
+                state.memory_state["route_penalties"] = penalties
+                self._record_failure(
+                    FailureEvent(
+                        tag=FailureTag.ROUTER_MISFIRE.value,
+                        reason="Tool output failed verification",
+                        details={"tool_name": tool_name},
+                    )
+                )
+            for failure in result.failures:
+                self._record_failure(
+                    FailureEvent(
+                        tag=verifier_failure_tag(failure.check_name),
+                        reason=failure.reason,
+                    )
+                )
         else:
             state.last_error = None
             state.memory_state["needs_revision"] = False
             constraints = state.memory_state.get("constraints")
             if isinstance(constraints, dict):
-                constraints.pop("verifier_issues", None)
+                constraints.pop("verifier_failures", None)
         state.memory_state["verifier_failures"] = failures
         if self.trace:
             self.trace.record(
                 "verifier",
                 {
                     "task_id": task.id,
-                    "ok": result.ok,
-                    "issues": result.issues,
+                    "ok": result.passed,
+                    "failures": [
+                        {
+                            "check_name": failure.check_name,
+                            "reason": failure.reason,
+                            "expected": failure.expected,
+                            "got": failure.got,
+                            "minimal_fix": failure.minimal_fix,
+                        }
+                        for failure in result.failures
+                    ],
                     "checks_run": result.checks_run,
                 },
             )
-            if state.last_error and state.last_error.get("issues"):
+            if state.last_error and state.last_error.get("failures"):
                 self.trace.record(
                     "verifier_issues",
-                    {"task_id": task.id, "issues": state.last_error["issues"][:3]},
+                    {
+                        "task_id": task.id,
+                        "issues": state.last_error["failures"][:3],
+                    },
                 )
         state.task_history.append(state.task_graph.model_copy(deep=True))
 
@@ -611,11 +750,11 @@ class Agent:
             else None
         )
         tool_count = len(self.memory.entries)
-        issue_count = len(result.issues) if result else None
+        issue_count = len(result.failures) if result else None
         state.progress.update(
             fact_count,
             tool_count,
-            result.ok,
+            result.passed,
             issue_count,
             fact_signature=fact_signature,
             structured_fact_count=structured_count,
@@ -694,21 +833,40 @@ class Agent:
             )
 
     def _attach_code_source(self, task: MicroTask, source: Any) -> MicroTask:
+        def attach(check: CheckSpec) -> CheckSpec:
+            if check.type == "code_run":
+                params = dict(check.params)
+                params["source"] = source or ""
+                return check.model_copy(update={"params": params})
+            if check.all_of:
+                return check.model_copy(update={"all_of": [attach(sub) for sub in check.all_of]})
+            if check.any_of:
+                return check.model_copy(update={"any_of": [attach(sub) for sub in check.any_of]})
+            return check
+
         updated = task.model_copy(deep=True)
-        params = dict(updated.check.params)
-        params["source"] = source or ""
-        updated.check = updated.check.model_copy(update={"params": params})
+        updated.check = attach(updated.check)
         return updated
 
     def _attach_tool_recompute(self, task: MicroTask, state: AgentState) -> MicroTask:
-        updated = task.model_copy(deep=True)
-        params = dict(updated.check.params)
         tool_name = state.memory_state.get("last_tool_name")
         tool_args = state.memory_state.get("last_tool_args")
-        if tool_name and isinstance(tool_args, dict):
-            params.setdefault("tool_name", tool_name)
-            params.setdefault("tool_args", tool_args)
-        updated.check = updated.check.model_copy(update={"params": params})
+
+        def attach(check: CheckSpec) -> CheckSpec:
+            if check.type == "tool_recompute":
+                params = dict(check.params)
+                if tool_name and isinstance(tool_args, dict):
+                    params.setdefault("tool_name", tool_name)
+                    params.setdefault("tool_args", tool_args)
+                return check.model_copy(update={"params": params})
+            if check.all_of:
+                return check.model_copy(update={"all_of": [attach(sub) for sub in check.all_of]})
+            if check.any_of:
+                return check.model_copy(update={"any_of": [attach(sub) for sub in check.any_of]})
+            return check
+
+        updated = task.model_copy(deep=True)
+        updated.check = attach(updated.check)
         return updated
 
     def _attach_tool_error_absent(self, task: MicroTask, state: AgentState) -> MicroTask:
@@ -900,18 +1058,20 @@ class Agent:
         if protocol is None and strict_json_mode:
             return False, ["Output is not valid JSON"]
         if isinstance(protocol, ProtocolFinal):
-            candidate_output = format_final(protocol.answer, protocol.checks)
+            candidate_output = format_final(
+                protocol.answer, protocol.checks, eval_mode=self.eval_mode
+            )
         else:
             candidate_output = response.final_text
         candidate_for_check = self._coerce_candidate_for_check(task, candidate_output)
         check_task = task
-        if check_task.check.type == "code_run":
+        if self._check_includes_type(check_task.check, "code_run"):
             check_task = self._attach_code_source(check_task, candidate_output)
         check_task = self._attach_tool_error_absent(check_task, state)
-        if check_task.check.type == "tool_recompute":
+        if self._check_includes_type(check_task.check, "tool_recompute"):
             check_task = self._attach_tool_recompute(check_task, state)
         result = verifier.verify(candidate_for_check, check_task)
-        return result.ok, result.issues
+        return result.passed, [failure.reason for failure in result.failures]
 
     def _is_objective_check(self, check: CheckSpec) -> bool:
         objective_predicates = {
@@ -921,7 +1081,16 @@ class Agent:
             "contains_fields",
             "unit_present",
         }
-        if check.type in {"schema", "contains_fields", "regex", "tool_recompute", "code_run"}:
+        if check.type in {
+            "schema",
+            "contains_fields",
+            "regex",
+            "tool_recompute",
+            "code_run",
+            "exact",
+            "numeric_tolerance",
+            "unit_sanity",
+        }:
             return True
         if check.type == "predicate":
             return check.params.get("name") in objective_predicates
@@ -951,14 +1120,22 @@ class Agent:
             parts.append(f"- Success: {criteria}")
         if current_task.tool_hint:
             parts.append(f"- Tool hint: {current_task.tool_hint}")
-        if state.last_error and state.last_error.get("issues"):
-            issues = state.last_error.get("issues") or []
-            top_issues = "; ".join(str(issue) for issue in issues[:3])
-            suggested = state.last_error.get("suggested_fix")
-            if suggested:
-                parts.append(f"- Fix issues: {top_issues} | Change: {suggested}")
-            else:
-                parts.append(f"- Fix issues: {top_issues}")
+        if state.last_error and state.last_error.get("failures"):
+            failures = state.last_error.get("failures") or []
+            constraint_lines = []
+            for failure in failures:
+                reason = failure.get("reason")
+                minimal_fix = failure.get("minimal_fix") or "Fix the failing check."
+                check_name = failure.get("check_name") or "check"
+                constraint_lines.append(
+                    f"{check_name}: {reason} | Fix: {minimal_fix}"
+                )
+            if constraint_lines:
+                parts.append("- Failing checks:")
+                parts.extend(f"  - {line}" for line in constraint_lines)
+                parts.append(
+                    "- Hard constraints: only satisfy the failing checks above."
+                )
         if strict_json_mode:
             parts.append("- Output: single JSON object only")
         if hint:
@@ -992,8 +1169,8 @@ class Agent:
             "tool_hint": self._truncate_text(task.tool_hint or "", 160),
             "stop_when": "verifier_ok",
         }
-        if state.last_error and state.last_error.get("issues"):
-            payload["verifier_issues"] = state.last_error.get("issues")[:3]
+        if state.last_error and state.last_error.get("failures"):
+            payload["verifier_failures"] = state.last_error.get("failures")[:3]
         return payload
 
     def _extract_required_fields(self, check: CheckSpec) -> list[str]:
@@ -1002,6 +1179,11 @@ class Agent:
             fields.extend(check.params.get("required_fields") or [])
         elif check.type == "json_protocol":
             fields.extend(check.params.get("required_keys") or ["answer"])
+        elif check.type == "schema":
+            schema = check.params.get("schema") or {}
+            if isinstance(schema, dict):
+                required = schema.get("required") or []
+                fields.extend(required)
         if check.all_of:
             for sub in check.all_of:
                 fields.extend(self._extract_required_fields(sub))
@@ -1191,7 +1373,7 @@ class Agent:
                 "role": "system",
                 "content": (
                     "Verify the answer. Respond with JSON only using "
-                    '{"type":"final","answer":"...","confidence":0.0,"checks":[...]} '
+                    '{"type":"final","answer":"...","scratchpad":"...","confidence":0.0,"checks":[...]} '
                     "No chain-of-thought."
                 ),
             },
@@ -1205,8 +1387,12 @@ class Agent:
         if response.final_text:
             protocol = parse_protocol(response.final_text)
             if isinstance(protocol, ProtocolFinal):
+                if protocol.scratchpad and self.trace:
+                    self.trace.record("scratchpad", {"content": protocol.scratchpad})
                 return AgentResult(
-                    answer=format_final(protocol.answer, protocol.checks),
+                    answer=format_final(
+                        protocol.answer, protocol.checks, eval_mode=self.eval_mode
+                    ),
                     checks=protocol.checks,
                     confidence=protocol.confidence,
                 )
@@ -1374,7 +1560,9 @@ class Agent:
                         continue
                     return current_answer
                 if isinstance(protocol, ProtocolFinal):
-                    current_answer = format_final(protocol.answer, protocol.checks)
+                    current_answer = format_final(
+                        protocol.answer, protocol.checks, eval_mode=self.eval_mode
+                    )
                 elif response.final_text:
                     current_answer = response.final_text
         return current_answer

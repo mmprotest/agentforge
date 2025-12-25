@@ -62,6 +62,10 @@ def build_model(settings: Settings):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="AgentForge CLI")
+    if len(sys.argv) > 1 and sys.argv[1] == "eval":
+        from agentforge.eval.harness import build_eval_parser
+
+        return build_eval_parser().parse_args()
     parser.add_argument("query", type=str, help="Prompt to run")
     parser.add_argument("--base-url", dest="base_url")
     parser.add_argument("--api-key", dest="api_key")
@@ -74,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-calls", type=int, dest="max_model_calls")
     parser.add_argument("--summary-lines", type=int, dest="summary_lines")
     parser.add_argument("--strict-json", action="store_true", dest="strict_json")
+    parser.add_argument("--eval-mode", action="store_true", dest="eval_mode")
     parser.add_argument("--code-check", action="store_true", dest="code_check")
     parser.add_argument("--code-check-max-iters", type=int, dest="code_check_max_iters")
     parser.add_argument("--max-message-chars", type=int, dest="max_message_chars")
@@ -86,6 +91,8 @@ def parse_args() -> argparse.Namespace:
 
 def apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
     data: dict[str, Any] = settings.model_dump()
+    if getattr(args, "eval_mode", False):
+        data["eval_mode"] = True
     if args.base_url:
         data["openai_base_url"] = args.base_url
     if args.api_key:
@@ -121,6 +128,11 @@ def apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
 
 def main() -> None:
     args = parse_args()
+    if getattr(args, "command", None) == "eval":
+        from agentforge.eval.harness import run_eval_harness
+
+        run_eval_harness(args)
+        return
     settings = apply_overrides(Settings(), args)
     model = build_model(settings)
     registry = build_registry(settings, model)
@@ -130,8 +142,10 @@ def main() -> None:
         summary_lines=settings.summary_lines,
     )
     policy = SafetyPolicy(max_model_calls=settings.max_model_calls)
-    verify_override = "--verify" in sys.argv
-    strict_json_override = "--strict-json" in sys.argv or settings.strict_json_mode
+    verify_override = "--verify" in sys.argv or settings.eval_mode
+    strict_json_override = (
+        "--strict-json" in sys.argv or settings.strict_json_mode or settings.eval_mode
+    )
     code_check_override = "--code-check" in sys.argv or settings.code_check
     code_check_iters_override = "--code-check-max-iters" in sys.argv
     agent = Agent(
@@ -158,8 +172,12 @@ def main() -> None:
         ),
         profile=args.profile,
         branch_candidates=settings.branch_candidates,
+        eval_mode=settings.eval_mode,
     )
     result = agent.run(args.query)
+    if settings.eval_mode:
+        print(result.answer, end="")
+        return
     print("Tools used:", ", ".join(result.tools_used) or "none")
     print("Tools created:", ", ".join(result.tools_created) or "none")
     print("Verify enabled:", "yes" if args.verify else "no")

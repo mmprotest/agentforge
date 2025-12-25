@@ -3,7 +3,7 @@ import json
 from agentforge.agent import Agent
 from agentforge.models.base import BaseChatModel, ModelResponse
 from agentforge.models.mock import MockChatModel
-from agentforge.routing import suggest_tool
+from agentforge.routing import suggest_tool, suggest_tools
 from agentforge.safety.policy import SafetyPolicy
 from agentforge.tools.base import Tool, ToolResult
 from agentforge.tools.registry import ToolRegistry
@@ -104,7 +104,7 @@ def test_router_hints_are_ephemeral():
         profile="qa",
         verify=False,
     )
-    result = agent.run('Use regex /foo/ on "foo bar"')
+    result = agent.run("Use regex on foo bar")
     assert "done" in result.answer
     assert any(
         "Router hint" in str(message.get("content"))
@@ -125,3 +125,21 @@ def test_regex_extract_builder_prefers_slash_pattern_and_quoted_text():
     assert args is not None
     assert args["pattern"] == "foo\\d+"
     assert args["text"] == "prefix foo123 suffix"
+
+
+def test_router_does_not_trigger_conversion_on_generic_to():
+    suggestions = suggest_tools("User query: I'd like to go to the store")
+    assert all(suggestion.tool_name != "unit_convert" for suggestion in suggestions)
+
+
+def test_router_triggers_conversion_on_convert_with_units():
+    suggestion = suggest_tool("User query: convert 5 km to m")
+    assert suggestion is not None
+    assert suggestion.tool_name == "unit_convert"
+
+
+def test_router_requires_path_or_file_intent_for_filesystem():
+    suggestions = suggest_tools("User query: file this idea for later")
+    assert all(suggestion.tool_name != "filesystem" for suggestion in suggestions)
+    suggestions = suggest_tools("User query: read file /tmp/example.txt")
+    assert any(suggestion.tool_name == "filesystem" for suggestion in suggestions)

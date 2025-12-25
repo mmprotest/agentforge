@@ -20,6 +20,7 @@ class ProtocolFinal:
     answer: str
     confidence: float
     checks: list[str]
+    scratchpad: str | None = None
 
 
 def parse_protocol(content: str) -> ProtocolToolCall | ProtocolFinal | None:
@@ -50,14 +51,20 @@ def protocol_from_payload(payload: dict[str, Any]) -> ProtocolToolCall | Protoco
         answer = payload.get("answer")
         confidence = payload.get("confidence", 0.0)
         checks = payload.get("checks") or []
+        scratchpad = payload.get("scratchpad")
         if not isinstance(answer, str):
             return None
         if not isinstance(confidence, (int, float)):
             confidence = 0.0
         if not isinstance(checks, list):
             checks = []
+        if scratchpad is not None and not isinstance(scratchpad, str):
+            scratchpad = None
         return ProtocolFinal(
-            answer=answer, confidence=float(confidence), checks=[str(c) for c in checks]
+            answer=answer,
+            confidence=float(confidence),
+            checks=[str(c) for c in checks],
+            scratchpad=scratchpad,
         )
     if "name" in payload and "arguments" in payload:
         name = payload.get("name")
@@ -72,7 +79,17 @@ def protocol_from_payload(payload: dict[str, Any]) -> ProtocolToolCall | Protoco
     return None
 
 
-def format_final(answer: str, checks: list[str]) -> str:
+def format_final(answer: str, checks: list[str], eval_mode: bool = False) -> str:
     """Format final user-facing response."""
+    if eval_mode:
+        trimmed = str(answer).rstrip()
+        if trimmed.startswith("{") and trimmed.endswith("}"):
+            try:
+                payload = json.loads(trimmed)
+            except json.JSONDecodeError:
+                return trimmed
+            if isinstance(payload, dict) and isinstance(payload.get("answer"), str):
+                return str(payload["answer"]).rstrip()
+        return trimmed
     summary = "; ".join(checks) if checks else "Answered the request."
     return f"{answer}\n\nWhat I did: {summary}"

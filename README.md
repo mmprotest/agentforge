@@ -8,7 +8,7 @@ AgentForge is a production-ready Python 3.11+ repository that implements an agen
 - Built-in tools: HTTP fetch, workspace filesystem, Python sandbox, deep thinking planner, calculator, regex extract, unit conversion, JSON repair, multi-file code runner.
 - Tool registry and validation pipeline for safe tool creation.
 - CLI and FastAPI server.
-- Eval harness with trace/replay support.
+- Eval harness with scoring, traces, and replay support.
 
 ## Quickstart
 
@@ -23,6 +23,12 @@ pip install -e .[dev]
 ```bash
 python -m agentforge "Hello from mock mode"
 ```
+
+### Benchmark-safe eval mode (answer-only)
+```bash
+python -m agentforge "2+2" --eval-mode
+```
+`--eval-mode` forces strict JSON contracts, verification, and prints only the final answer to stdout.
 
 ### Profiles (small-model friendly defaults)
 Profiles tune budgets, routing thresholds, and verification defaults:
@@ -84,6 +90,7 @@ Environment variables (CLI flags override env vars):
 - `CODE_CHECK` (default `false`)
 - `CODE_CHECK_MAX_ITERS` (default `2`)
 - `SANDBOX_PASSTHROUGH_ENV` (comma-separated allowlist of extra env vars)
+- `EVAL_MODE` (default `false`)
 
 Recommended small-model settings:
 ```bash
@@ -107,6 +114,29 @@ backtrack after repeated failures or stalled progress. Verification runs local c
 schema validation, regex/predicate checks, tool recomputation, and code execution. Backtracking
 rewinds the microtask graph and adds a brief hint for a new approach, which makes runs more robust
 on smaller OpenAI-compatible models.
+
+### Task graphs and checks
+The planner emits a JSON task graph with strict schema validation:
+- Top-level fields: `version`, `objective`, `tasks`, `final_task_id`
+- Each task: `id`, `goal`, `inputs`, `tool_hint` (optional), `checks`, `max_attempts`, `budget_hint`
+- Supported check types: `schema`, `regex`, `exact`, `numeric_tolerance`, `tool_recompute`, `unit_sanity`
+
+If a plan fails validation (too many tasks, duplicate ids, cycles, unsupported checks), the controller
+falls back to a safe default graph: extract constraints → compute/solve → format answer.
+
+## Eval harness
+Run the benchmark harness:
+```bash
+agentforge eval --dataset examples/eval_sample.jsonl --output results.jsonl --scorer exact --eval-mode
+```
+Each output record includes the input, prediction, expected value, score, failure tags, and trace path.
+
+### Dataset format (JSONL)
+Each line is a JSON object with:
+- `id`: unique identifier
+- `input` (or `query`): prompt text
+- `expected`: expected answer (string/number)
+- Optional fields for scorers: `pattern` (regex), `schema` (JSON schema)
 
 ## Tool creation gating
 Tool creation is disabled by default. Enable it by setting `ALLOW_TOOL_CREATION=true` or using `--allow-tool-creation`. Generated tools are validated with AST-based checks and executed in a sandboxed test process before registration.

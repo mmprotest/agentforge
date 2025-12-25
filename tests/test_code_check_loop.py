@@ -25,6 +25,7 @@ result = 1 + 1
         scripted=[
             ModelResponse(final_text=buggy_payload),
             ModelResponse(final_text=fixed_payload),
+            ModelResponse(final_text=fixed_payload),
         ]
     )
     registry = ToolRegistry()
@@ -49,7 +50,12 @@ result = Counter(["a", "a", "b"])
     payload = json.dumps(
         {"type": "final", "answer": snippet, "confidence": 0.2, "checks": []}
     )
-    model = MockChatModel(scripted=[ModelResponse(final_text=payload)])
+    model = MockChatModel(
+        scripted=[
+            ModelResponse(final_text=payload),
+            ModelResponse(final_text=payload),
+        ]
+    )
     registry = ToolRegistry()
     registry.register(PythonSandboxTool(str(tmp_path)))
     agent = Agent(
@@ -76,6 +82,7 @@ result = 1 + 1
     model = MockChatModel(
         scripted=[
             ModelResponse(final_text=buggy_payload),
+            ModelResponse(final_text=corrected),
             ModelResponse(final_text=corrected),
         ]
     )
