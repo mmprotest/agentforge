@@ -394,6 +394,9 @@ class Verifier:
             text = str(candidate_output)
             if unit and str(unit) not in text:
                 issues.append(f"Missing unit '{unit}'")
+        elif name == "mcq_choice":
+            if not re.search(r"\b[A-E]\b", str(candidate_output), re.IGNORECASE):
+                issues.append("Output is not a valid MCQ choice (A-E)")
         else:
             issues.append(f"Unknown predicate '{name}'")
         return issues

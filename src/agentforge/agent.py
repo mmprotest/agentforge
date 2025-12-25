@@ -215,7 +215,7 @@ class Agent:
             self.trace.record_messages(self._messages)
 
         policy_engine = PolicyEngine(profile)
-        controller = Controller(policy_engine)
+        controller = Controller(policy_engine, self.registry)
         verifier = Verifier(self._run_tool)
         budgets = AgentBudgets(
             model_calls=min(self.max_model_calls, profile.budgets.model_calls),
@@ -266,6 +266,10 @@ class Agent:
                 "tool_handle_count": 0,
                 "last_tool_facts": [],
                 "scratchpad": None,
+                "fast_path": False,
+                "path_type_logged": False,
+                "tool_failure_counts": {},
+                "disabled_tools": [],
             }
         )
         state.memory_state.setdefault("facts_structured", [])
@@ -280,14 +284,28 @@ class Agent:
                 query, state.last_tool_summary, last_parse_failed
             )
             action = controller.decide(state)
+            if state.memory_state.get("path_type") and not state.memory_state.get("path_type_logged"):
+                state.memory_state["fast_path"] = state.memory_state.get("path_type") == "fast"
+                if self.trace:
+                    self.trace.record(
+                        "controller_path",
+                        {
+                            "path": state.memory_state.get("path_type"),
+                            "reason": state.memory_state.get("path_reason"),
+                        },
+                    )
+                state.memory_state["path_type_logged"] = True
             if action.type == ActionType.ROUTE_TOOL:
                 if state.budgets.tool_calls <= 0:
                     state.memory_state["pending_verification"] = True
                     continue
+                current_task = state.task_graph.current_task
                 tool_name = action.tool_name or ""
                 state.memory_state["last_routed_tool"] = tool_name
-                direct_args = action.tool_args or self._direct_tool_args(
-                    tool_name, query, last_parse_failed
+                direct_args = (
+                    action.tool_args
+                    if action.tool_args is not None
+                    else self._direct_tool_args(tool_name, query, last_parse_failed)
                 )
                 if direct_args is None:
                     state.last_error = {
@@ -329,6 +347,7 @@ class Agent:
                 entry = self._handle_tool_result(
                     tool_name, output, None, direct_args
                 )
+                self._record_tool_execution(state, current_task, tool_name)
                 state.budgets.tool_calls -= 1
                 state.last_tool_summary = entry.summary
                 self.memory.state["last_tool_summary"] = state.last_tool_summary
@@ -360,7 +379,7 @@ class Agent:
                     call_messages.append(contract_message)
                 retry_instruction = None
                 format_retry_message = None
-                tools = self.registry.openai_schemas()
+                tools = [] if state.memory_state.get("fast_path") else self.registry.openai_schemas()
                 current_task = state.task_graph.current_task
                 response = self._run_model_candidates(
                     call_messages,
@@ -371,6 +390,7 @@ class Agent:
                     strict_json_mode,
                 )
                 protocol = None
+                forced_tool_name = action.tool_name
                 if response.final_text:
                     protocol = self._parse_model_protocol(response.final_text)
                     if protocol is None and strict_json_mode:
@@ -403,6 +423,28 @@ class Agent:
                         )
                     if protocol is not None:
                         last_parse_failed = None
+                if forced_tool_name:
+                    if response.tool_call is None and isinstance(protocol, ProtocolToolCall):
+                        response = response.model_copy(
+                            update={"tool_call": protocol_to_toolcall(protocol)}
+                        )
+                    if response.tool_call is None or response.tool_call.name != forced_tool_name:
+                        state.last_error = {
+                            "error": f"Forced tool call required: {forced_tool_name}",
+                            "suggested_fix": f"Return a tool call for {forced_tool_name} only.",
+                        }
+                        state.memory_state["forced_tool_model_failures"] = (
+                            state.memory_state.get("forced_tool_model_failures", 0) + 1
+                        )
+                        last_parse_failed = response.final_text
+                        self._record_failure(
+                            FailureEvent(
+                                tag=FailureTag.FORMAT_VIOLATION.value,
+                                reason="Forced tool call required",
+                                details={"tool_name": forced_tool_name},
+                            )
+                        )
+                        continue
                 if response.tool_call is None and isinstance(protocol, ProtocolToolCall):
                     response = response.model_copy(
                         update={"tool_call": protocol_to_toolcall(protocol)}
@@ -483,6 +525,7 @@ class Agent:
                     response.tool_call.id,
                     response.tool_call.arguments,
                 )
+                self._record_tool_execution(state, current_task, tool_name)
                 state.last_tool_summary = entry.summary
                 self.memory.state["last_tool_summary"] = state.last_tool_summary
                 state.memory_state["candidate_output"] = output
@@ -519,6 +562,7 @@ class Agent:
                 state.budgets.verifies -= 1
                 state.memory_state["pending_verification"] = False
                 self._record_verifier_result(state, current_task, result)
+                self._record_verification_event(state, current_task, result.passed)
                 if result.passed:
                     state.task_graph.mark_done(current_task.id)
                     if current_task.goal.lower().startswith("draft"):
@@ -528,11 +572,16 @@ class Agent:
                     if current_task.goal.lower().startswith("final"):
                         state.memory_state["final_answer"] = candidate
                 else:
-                    state.task_graph.record_attempt(current_task.id)
-                    if current_task.attempts >= current_task.max_attempts:
+                    if self._is_forced_tool_task(current_task):
                         state.task_graph.mark_failed(
-                            current_task.id, notes="Max attempts exceeded"
+                            current_task.id, notes="Forced tool verification failed"
                         )
+                    else:
+                        state.task_graph.record_attempt(current_task.id)
+                        if current_task.attempts >= current_task.max_attempts:
+                            state.task_graph.mark_failed(
+                                current_task.id, notes="Max attempts exceeded"
+                            )
                 self._update_progress(state, result)
                 continue
             if action.type == ActionType.BACKTRACK:
@@ -624,6 +673,7 @@ class Agent:
         penalties = state.memory_state.get("route_penalties", {})
         penalties[tool_name] = penalties.get(tool_name, 0) + 1
         state.memory_state["route_penalties"] = penalties
+        self._increment_tool_failure(state, tool_name)
         state.last_error = {
             "error": f"Tool error from {tool_name}",
             "suggested_fix": "Adjust arguments or try an alternative tool.",
@@ -676,17 +726,18 @@ class Agent:
             constraints = state.memory_state.setdefault("constraints", {})
             if isinstance(constraints, dict):
                 constraints["verifier_failures"] = failure_payload
-            if state.memory_state.get("candidate_source") == "tool":
-                tool_name = state.memory_state.get("last_tool_name") or "tool"
-                penalties = state.memory_state.get("route_penalties", {})
-                penalties[tool_name] = penalties.get(tool_name, 0) + 1
-                state.memory_state["route_penalties"] = penalties
-                self._record_failure(
-                    FailureEvent(
-                        tag=FailureTag.ROUTER_MISFIRE.value,
-                        reason="Tool output failed verification",
-                        details={"tool_name": tool_name},
-                    )
+        if state.memory_state.get("candidate_source") == "tool":
+            tool_name = state.memory_state.get("last_tool_name") or "tool"
+            penalties = state.memory_state.get("route_penalties", {})
+            penalties[tool_name] = penalties.get(tool_name, 0) + 1
+            state.memory_state["route_penalties"] = penalties
+            self._increment_tool_failure(state, tool_name)
+            self._record_failure(
+                FailureEvent(
+                    tag=FailureTag.ROUTER_MISFIRE.value,
+                    reason="Tool output failed verification",
+                    details={"tool_name": tool_name},
+                )
                 )
             for failure in result.failures:
                 self._record_failure(
@@ -730,6 +781,53 @@ class Agent:
                     },
                 )
         state.task_history.append(state.task_graph.model_copy(deep=True))
+
+    def _increment_tool_failure(self, state: AgentState, tool_name: str) -> None:
+        counts = state.memory_state.get("tool_failure_counts", {})
+        counts[tool_name] = counts.get(tool_name, 0) + 1
+        state.memory_state["tool_failure_counts"] = counts
+        if counts[tool_name] >= 2:
+            # Hard-disable tools after repeated failures to avoid routing loops.
+            disabled = set(state.memory_state.get("disabled_tools", []))
+            if tool_name not in disabled:
+                disabled.add(tool_name)
+                state.memory_state["disabled_tools"] = sorted(disabled)
+                if self.trace:
+                    self.trace.record(
+                        "tool_disabled",
+                        {"tool_name": tool_name, "reason": "failure_count"},
+                    )
+
+    def _record_tool_execution(
+        self,
+        state: AgentState,
+        current_task: MicroTask | None,
+        tool_name: str,
+    ) -> None:
+        event_id = state.memory_state.get("tool_event_id", 0) + 1
+        state.memory_state["tool_event_id"] = event_id
+        state.memory_state["last_executed_tool"] = tool_name
+        state.memory_state["last_executed_task_id"] = current_task.id if current_task else None
+        state.memory_state["last_task_tool_hint"] = (
+            current_task.tool_hint if current_task else None
+        )
+
+    def _record_verification_event(
+        self,
+        state: AgentState,
+        task: MicroTask,
+        ok: bool,
+    ) -> None:
+        event_id = state.memory_state.get("verification_event_id", 0) + 1
+        state.memory_state["verification_event_id"] = event_id
+        state.memory_state["last_verification_task_id"] = task.id
+        state.memory_state["last_verification_ok"] = ok
+
+    def _is_forced_tool_task(self, task: MicroTask) -> bool:
+        tool_hint = (task.tool_hint or "").strip()
+        if not tool_hint or tool_hint.lower() == "router":
+            return False
+        return self.registry.get(tool_hint) is not None
 
     def _update_progress(self, state: AgentState, result: "VerifierResult") -> None:
         facts = state.memory_state.get("facts")
@@ -1080,6 +1178,7 @@ class Agent:
             "numeric_range",
             "contains_fields",
             "unit_present",
+            "mcq_choice",
         }
         if check.type in {
             "schema",
