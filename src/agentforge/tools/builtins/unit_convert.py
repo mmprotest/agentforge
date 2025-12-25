@@ -21,8 +21,8 @@ class UnitConvertTool(Tool):
     def run(self, data: BaseModel) -> ToolResult:
         payload = UnitConvertInput.model_validate(data)
         value = payload.value
-        from_unit = payload.from_unit.lower()
-        to_unit = payload.to_unit.lower()
+        from_unit = _normalize_unit(payload.from_unit)
+        to_unit = _normalize_unit(payload.to_unit)
         converted = convert_units(value, from_unit, to_unit)
         return ToolResult(output={"value": converted, "unit": to_unit})
 
@@ -53,7 +53,16 @@ _TIME = {
 }
 
 
+def _normalize_unit(unit: str) -> str:
+    cleaned = unit.strip().lower()
+    if cleaned.startswith("°"):
+        cleaned = cleaned[1:]
+    return cleaned
+
+
 def convert_units(value: float, from_unit: str, to_unit: str) -> float:
+    from_unit = _normalize_unit(from_unit)
+    to_unit = _normalize_unit(to_unit)
     if from_unit in _LENGTH and to_unit in _LENGTH:
         return value * _LENGTH[from_unit] / _LENGTH[to_unit]
     if from_unit in _MASS and to_unit in _MASS:
