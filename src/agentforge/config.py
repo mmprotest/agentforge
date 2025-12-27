@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Literal
-
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -32,43 +30,9 @@ class Settings(BaseSettings):
     openai_force_chatcompletions_path: str | None = Field(
         default=None, validation_alias="OPENAI_FORCE_CHATCOMPLETIONS_PATH"
     )
-    agent_mode: Literal["direct", "deep"] = Field(
-        default="direct", validation_alias="AGENT_MODE"
-    )
-    allow_tool_creation: bool = Field(
-        default=False, validation_alias="ALLOW_TOOL_CREATION"
-    )
-    workspace_dir: str = Field(default="./workspace", validation_alias="WORKSPACE_DIR")
-    max_tool_output_chars: int = Field(
-        default=4000, validation_alias="MAX_TOOL_OUTPUT_CHARS"
-    )
-    keep_raw_tool_output: bool = Field(
-        default=True, validation_alias="KEEP_RAW_TOOL_OUTPUT"
-    )
-    summary_lines: int = Field(default=10, validation_alias="SUMMARY_LINES")
-    max_model_calls: int = Field(default=20, validation_alias="MAX_MODEL_CALLS")
-    max_message_chars: int = Field(default=24000, validation_alias="MAX_MESSAGE_CHARS")
-    max_message_tokens_approx: int = Field(
-        default=6000, validation_alias="MAX_MESSAGE_TOKENS_APPROX"
-    )
-    token_char_ratio: int = Field(default=4, validation_alias="TOKEN_CHAR_RATIO")
-    max_single_message_chars: int = Field(
-        default=4000, validation_alias="MAX_SINGLE_MESSAGE_CHARS"
-    )
-    max_turns: int = Field(default=20, validation_alias="MAX_TURNS")
-    trim_strategy: Literal["drop_oldest"] = Field(
-        default="drop_oldest", validation_alias="TRIM_STRATEGY"
-    )
-    branch_candidates: int = Field(default=1, validation_alias="BRANCH_CANDIDATES")
-    strict_json_mode: bool = Field(default=False, validation_alias="STRICT_JSON_MODE")
-    code_check: bool = Field(default=False, validation_alias="CODE_CHECK")
-    code_check_max_iters: int = Field(
-        default=2, validation_alias="CODE_CHECK_MAX_ITERS"
-    )
-    sandbox_passthrough_env: str | None = Field(
-        default=None, validation_alias="SANDBOX_PASSTHROUGH_ENV"
-    )
-    eval_mode: bool = Field(default=False, validation_alias="EVAL_MODE")
+    proposal_count: int = Field(default=3, validation_alias="PROPOSAL_COUNT")
+    max_backtracks: int = Field(default=1, validation_alias="MAX_BACKTRACKS")
+    max_attempts: int = Field(default=10, validation_alias="MAX_ATTEMPTS")
 
 
 DEFAULT_SETTINGS = Settings()

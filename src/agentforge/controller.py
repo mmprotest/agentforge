@@ -1,445 +1,176 @@
-"""Deterministic controller for agent decisions."""
+"""Controller implementing propose -> verify -> select with backtracking."""
 
 from __future__ import annotations
 
-from enum import Enum
-import re
-from typing import Any
+import json
+from dataclasses import dataclass
 
-from pydantic import BaseModel
-
-from agentforge.policy_engine import PolicyEngine
-from agentforge.planner import safe_plan_to_graph
-from agentforge.profiles import (
-    build_graph_agent,
-    build_graph_code,
-    build_graph_math,
-    infer_profile,
-)
-from agentforge.routing import is_code_task, suggest_tool
-from agentforge.tasks import CheckSpec, MicroTask, TaskGraph
-from agentforge.tools.registry import ToolRegistry
-from agentforge.util.logging import get_logger
+from agentforge.models.base import BaseChatModel
+from agentforge.state import AgentState, Proposal, VerifierResult
+from agentforge.verifier import Verifier
 
 
-class ActionType(str, Enum):
-    ROUTE_TOOL = "route_tool"
-    MODEL_TOOL = "model_tool"
-    VERIFY = "verify"
-    BACKTRACK = "backtrack"
-    FINAL = "final"
+@dataclass
+class ProposalAssessment:
+    proposal: Proposal
+    results: list[VerifierResult]
 
-
-class Action(BaseModel):
-    type: ActionType
-    tool_name: str | None = None
-    tool_args: dict[str, Any] | None = None
-    message_to_model: str | None = None
-    reason: str
+    @property
+    def passed(self) -> bool:
+        return all(result.pass_fail for result in self.results)
 
 
 class Controller:
-    """Deterministic controller that decides next action."""
-
-    def __init__(self, policy_engine: PolicyEngine, registry: ToolRegistry | None = None) -> None:
-        self.policy_engine = policy_engine
-        self.registry = registry or ToolRegistry()
-        self.logger = get_logger("agentforge.controller")
-
-    def decide(self, state: "AgentState") -> Action:
-        self._log_task_activity(state)
-        if state.task_graph is None or not state.task_graph.tasks:
-            path_type, reason = self._select_path(
-                state.query,
-                profile=state.profile,
-                profile_explicit=state.profile_explicit,
-                code_check_enabled=bool(state.memory_state.get("code_check_enabled")),
-            )
-            state.memory_state["path_type"] = path_type
-            state.memory_state["path_reason"] = reason
-            state.task_graph = self._initial_task_graph(
-                state.query,
-                state.profile,
-                state.profile_explicit,
-                bool(state.memory_state.get("code_check_enabled")),
-            )
-            self.logger.info(
-                "controller.path selected=%s reason=%s",
-                path_type,
-                reason,
-            )
-            self.logger.info(
-                "controller.task_graph built=%s tasks=%s",
-                bool(state.task_graph.tasks),
-                len(state.task_graph.tasks),
-            )
-            state.task_history.append(state.task_graph.model_copy(deep=True))
-
-        if state.task_graph.all_done():
-            return Action(type=ActionType.FINAL, reason="tasks complete")
-
-        if state.budgets.model_calls <= 0 and state.budgets.tool_calls <= 0:
-            return Action(type=ActionType.FINAL, reason="budget exhausted")
-
-        if state.memory_state.get("pending_verification") and state.budgets.verifies > 0:
-            return Action(type=ActionType.VERIFY, reason="verification pending")
-
-        if self._should_backtrack(state):
-            return Action(type=ActionType.BACKTRACK, reason="backtrack triggered")
-
-        current_task = state.task_graph.current_task or state.task_graph.next_task()
-        if current_task is None:
-            return Action(type=ActionType.FINAL, reason="no pending tasks")
-        forced_tool = self._valid_tool_hint(current_task.tool_hint)
-        if forced_tool and self._check_includes_type(current_task.check, "code_run"):
-            forced_tool = None
-        if forced_tool:
-            retry_counts = state.memory_state.setdefault("forced_tool_attempts", {})
-            attempts = retry_counts.get(current_task.id, 0)
-            if attempts >= 2:
-                state.task_graph.mark_failed(
-                    current_task.id, notes="Forced tool retries exceeded"
-                )
-                self.logger.info(
-                    "controller.task tool_hint=%s task_id=%s forced_retry_exceeded",
-                    forced_tool,
-                    current_task.id,
-                )
-                return self.decide(state)
-        if current_task.id != state.last_snapshot_task_id:
-            self._snapshot_state(state)
-            state.last_snapshot_task_id = current_task.id
-        if (
-            current_task.goal.lower().startswith("final")
-            and state.memory_state.get("candidate_output") is not None
-            and state.budgets.verifies > 0
-            and state.memory_state.get("candidate_source") != "tool"
-        ):
-            return Action(type=ActionType.VERIFY, reason="finalize candidate")
-        if (
-            self._check_includes_type(current_task.check, "code_run")
-            and state.memory_state.get(current_task.inputs.get("source_key"))
-            and state.budgets.verifies > 0
-            and not state.memory_state.get("needs_revision")
-        ):
-            return Action(type=ActionType.VERIFY, reason="code check ready")
-        if (
-            self._check_includes_type(current_task.check, "tool_recompute")
-            and state.memory_state.get("last_tool_output") is not None
-            and state.budgets.verifies > 0
-            and not state.memory_state.get("needs_revision")
-        ):
-            return Action(type=ActionType.VERIFY, reason="tool recompute ready")
-
-        if forced_tool:
-            retry_counts = state.memory_state.setdefault("forced_tool_attempts", {})
-            retry_counts[current_task.id] = retry_counts.get(current_task.id, 0) + 1
-            state.memory_state["forced_tool_name"] = forced_tool
-            if self._tool_requires_args(forced_tool):
-                return Action(
-                    type=ActionType.MODEL_TOOL,
-                    tool_name=forced_tool,
-                    reason="forced tool requires arguments",
-                    message_to_model="[ForceTool] Respond with a tool call only.",
-                )
-            return Action(
-                type=ActionType.ROUTE_TOOL,
-                tool_name=forced_tool,
-                tool_args={},
-                reason="forced tool execution",
-            )
-
-        routing_prompt = state.routing_prompt
-        decision = None
-        if (
-            routing_prompt
-            and state.memory_state.get("path_type") != "fast"
-            and (current_task.tool_hint in (None, "router"))
-        ):
-            decision = self.policy_engine.route(
-                routing_prompt,
-                penalties=state.memory_state.get("route_penalties", {}),
-                disabled_tools=set(state.memory_state.get("disabled_tools", [])),
-            )
-        if decision and decision.must_call and state.budgets.tool_calls > 0:
-            return Action(
-                type=ActionType.ROUTE_TOOL,
-                tool_name=decision.tool_name,
-                tool_args=decision.suggested_args,
-                reason=decision.reason,
-            )
-
-        hint = None
-        if decision and decision.suggest_only:
-            hint = self.policy_engine.hint_from_decision(decision)
-
-        if state.last_error and state.last_error.get("suggested_fix"):
-            hint = self._merge_hint(hint, state.last_error["suggested_fix"])
-
-        return Action(
-            type=ActionType.MODEL_TOOL,
-            reason="model step",
-            message_to_model=hint,
-        )
-
-    def _initial_task_graph(
+    def __init__(
         self,
-        query: str,
-        profile: str,
-        profile_explicit: bool,
-        code_check_enabled: bool,
-    ) -> TaskGraph:
-        if not profile_explicit or profile == "agent":
-            profile = infer_profile(query)
-        if profile == "code" or code_check_enabled:
-            graph = build_graph_code(query)
-        elif profile == "math":
-            graph = build_graph_math(query)
-        elif profile == "qa":
-            graph = safe_plan_to_graph(query)
-        else:
-            if self._select_path(
-                query,
-                profile=profile,
-                profile_explicit=profile_explicit,
-                code_check_enabled=code_check_enabled,
-            )[0] == "fast":
-                graph = self._fast_task_graph(query)
-            else:
-                graph = build_graph_agent(query) if profile == "agent" else safe_plan_to_graph(query)
-        graph.tasks = [self._strengthen_task(task) for task in graph.tasks]
-        return graph
+        model: BaseChatModel,
+        verifiers: list[Verifier],
+        proposal_count: int = 3,
+        max_backtracks: int = 1,
+        max_attempts: int = 10,
+        seed: int = 0,
+    ) -> None:
+        self.model = model
+        self.verifiers = verifiers
+        self.proposal_count = max(1, proposal_count)
+        self.max_backtracks = max(0, max_backtracks)
+        self.max_attempts = max(1, max_attempts)
+        self.seed = seed
 
-    def _strengthen_task(self, task: MicroTask) -> MicroTask:
-        check = task.check
-        if (
-            check.type == "predicate"
-            and check.params.get("name") == "non_empty"
-            and not check.all_of
-            and not check.any_of
-        ):
-            if task.goal.lower().startswith("final"):
-                updated = task.model_copy(deep=True)
-                updated.check = CheckSpec(
-                    type="contains_fields",
-                    params={"required_fields": ["answer"]},
-                )
-                return updated
-            if task.tool_hint:
-                updated = task.model_copy(deep=True)
-                updated.check = CheckSpec(
-                    type="none",
-                    all_of=[
-                        CheckSpec(type="predicate", params={"name": "non_empty"}),
-                        CheckSpec(type="tool_error_absent"),
-                    ],
-                )
-                return updated
-        return task
-
-    def _snapshot_state(self, state: "AgentState") -> None:
-        from agentforge.state import StateSnapshot
-
-        memory_keys = [
-            "facts",
-            "facts_structured",
-            "constraints",
-            "intermediates",
-            "draft_answer",
-            "candidate_output",
-            "candidate_source",
-            "candidate_checks",
-            "candidate_confidence",
-            "pending_verification",
-            "verifier_failures",
-            "tool_error_counts",
-            "last_tool_output",
-            "last_tool_name",
-            "last_tool_args",
-            "final_answer",
-            "needs_revision",
-            "tool_handles",
-            "tool_handle_count",
-            "last_tool_facts",
-        ]
-        subset = {
-            key: state.memory_state.get(key)
-            for key in memory_keys
-            if key in state.memory_state
-        }
-        snapshot = StateSnapshot(
-            task_graph=state.task_graph.model_copy(deep=True),
-            memory_state_subset=subset,
-            progress_state=state.progress.to_dict(),
-            last_tool_summary=state.last_tool_summary,
-            last_error=state.last_error,
-            tool_error_counts=state.memory_state.get("tool_error_counts", {}),
-            verifier_failures=state.memory_state.get("verifier_failures", {}),
-            tool_handle_count=int(state.memory_state.get("tool_handle_count", 0) or 0),
-            tool_handles=list(state.memory_state.get("tool_handles", []) or []),
-        )
-        state.snapshots.append(snapshot)
-
-    def _should_backtrack(self, state: "AgentState") -> bool:
-        if state.budgets.backtracks <= 0:
-            return False
-        failures = state.memory_state.get("verifier_failures", {})
-        current_task = state.task_graph.current_task
-        if current_task and failures.get(current_task.id, 0) >= 2:
-            return True
-        tool_errors = state.memory_state.get("tool_error_counts", {})
-        if any(count >= 2 for count in tool_errors.values()):
-            return True
-        if state.progress.iterations_without_progress >= 3:
-            return True
-        return False
-
-    def _merge_hint(self, hint: str | None, fix: str) -> str:
-        if hint:
-            return f"{hint}\n[Fix] {fix}"
-        return f"[Fix] {fix}"
-
-    def _check_includes_type(self, check: CheckSpec, check_type: str) -> bool:
-        if check.type == check_type:
-            return True
-        if check.all_of and any(
-            self._check_includes_type(sub, check_type) for sub in check.all_of
-        ):
-            return True
-        if check.any_of and any(
-            self._check_includes_type(sub, check_type) for sub in check.any_of
-        ):
-            return True
-        return False
-
-    def _valid_tool_hint(self, tool_hint: str | None) -> str | None:
-        if not tool_hint:
-            return None
-        normalized = tool_hint.strip()
-        if not normalized or normalized.lower() == "router":
-            return None
-        if self.registry.get(normalized) is None:
-            return None
-        return normalized
-
-    def _tool_requires_args(self, tool_name: str) -> bool:
-        tool = self.registry.get(tool_name)
-        if tool is None:
-            return False
-        if getattr(tool, "input_schema", None) is None:
-            return False
-        schema = tool.input_schema.model_json_schema()
-        required = schema.get("required") or []
-        return bool(required)
-
-    def _select_path(
-        self,
-        query: str,
-        profile: str | None = None,
-        profile_explicit: bool = False,
-        code_check_enabled: bool = False,
-    ) -> tuple[str, str]:
-        text = query.strip()
-        if not text:
-            return "fast", "empty_query"
-        if profile_explicit and profile and profile != "agent":
-            return "slow", "explicit_profile"
-        if profile in {"code", "math", "qa"}:
-            return "slow", "profile_inferred"
-        if code_check_enabled:
-            return "slow", "code_check"
-        if self._is_mcq(text):
-            return "fast", "mcq"
-        if self._is_simple_math(text):
-            return "fast", "simple_math"
-        if self._is_slow_task(text):
-            return "slow", "complex_or_tool_heavy"
-        if self._has_tool_intent(text):
-            return "slow", "tool_intent"
-        if self._is_short_factual(text):
-            return "fast", "short_factual"
-        return "slow", "default"
-
-    def _fast_task_graph(self, query: str) -> TaskGraph:
-        check = CheckSpec(type="predicate", params={"name": "non_empty"})
-        if self._is_mcq(query):
-            check = CheckSpec(type="predicate", params={"name": "mcq_choice"})
-        elif self._is_simple_math(query):
-            check = CheckSpec(type="predicate", params={"name": "looks_numeric"})
-        task = MicroTask(
-            id="fast-1",
-            goal="final answer",
-            inputs={"query": query},
-            expected_schema=None,
-            tool_hint=None,
-            check=check,
-            status="pending",
-            attempts=0,
-            max_attempts=1,
-            notes=None,
-        )
-        return TaskGraph(tasks=[task])
-
-    def _is_mcq(self, text: str) -> bool:
-        return bool(
-            re.search(r"\b[A-E]\s*[\).\:]", text, re.IGNORECASE)
-            or re.search(r"\boption\s+[A-E]\b", text, re.IGNORECASE)
-            or re.search(r"\bchoices?\b", text, re.IGNORECASE)
-        )
-
-    def _is_simple_math(self, text: str) -> bool:
-        return bool(re.search(r"\d[\d\s\+\-\*/\(\)]+", text))
-
-    def _is_short_factual(self, text: str) -> bool:
-        tokens = re.findall(r"\w+", text)
-        return len(tokens) <= 8 and not is_code_task(text)
-
-    def _is_slow_task(self, text: str) -> bool:
-        lowered = text.lower()
-        if is_code_task(text):
-            return True
-        if any(
-            token in lowered
-            for token in [
-                "steps",
-                "multi-step",
-                "plan",
-                "implement",
-                "build",
-                "analyze",
-                "do work",
-                "tool",
+    def run(self, state: AgentState) -> str:
+        backtracks_remaining = self.max_backtracks
+        while state.attempts < self.max_attempts:
+            snapshot = state.model_copy(deep=True)
+            assessments = self._assess_proposals(state)
+            state.artifacts["proposals"] = [
+                {
+                    "action": item.proposal.action,
+                    "rationale": item.proposal.rationale,
+                    "results": [result.model_dump() for result in item.results],
+                }
+                for item in assessments
             ]
-        ):
-            return True
-        return False
-
-    def _has_tool_intent(self, text: str) -> bool:
-        suggestion = suggest_tool(f"User query: {text}")
-        return suggestion is not None
-
-    def _log_task_activity(self, state: "AgentState") -> None:
-        tool_event_id = state.memory_state.get("tool_event_id")
-        last_logged_tool = state.memory_state.get("logged_tool_event_id")
-        if tool_event_id is not None and tool_event_id != last_logged_tool:
-            task_id = state.memory_state.get("last_executed_task_id")
-            tool_hint = state.memory_state.get("last_task_tool_hint")
-            tool_name = state.memory_state.get("last_executed_tool")
-            self.logger.info(
-                "controller.task tool_exec task_id=%s tool_hint=%s tool=%s",
-                task_id,
-                tool_hint,
-                tool_name,
+            state.verifier_results.extend(
+                result for item in assessments for result in item.results
             )
-            state.memory_state["logged_tool_event_id"] = tool_event_id
-        verify_event_id = state.memory_state.get("verification_event_id")
-        last_logged_verify = state.memory_state.get("logged_verification_event_id")
-        if verify_event_id is not None and verify_event_id != last_logged_verify:
-            task_id = state.memory_state.get("last_verification_task_id")
-            result = state.memory_state.get("last_verification_ok")
-            self.logger.info(
-                "controller.task verify task_id=%s result=%s",
-                task_id,
-                result,
-            )
-            state.memory_state["logged_verification_event_id"] = verify_event_id
+            ordered = self._rank_assessments(assessments, state)
+            selected = None
+            for item in ordered:
+                if not item.passed:
+                    state.attempts += 1
+                    continue
+                selected = item.proposal
+                break
+            if selected is not None:
+                state.history.append(selected.action)
+                state.artifacts["selected_branch"] = state.branch_id
+                state.artifacts["selected_action"] = selected.action
+                return selected.action
+            if backtracks_remaining <= 0:
+                state.artifacts["selected_branch"] = state.branch_id
+                state.artifacts["selected_action"] = ""
+                return ""
+            self._restore_state(state, snapshot)
+            backtracks_remaining -= 1
+            state.branch_id = f"branch-{self.max_backtracks - backtracks_remaining}"
+            state.history.append("backtrack")
+            state.artifacts["backtracks"] = self.max_backtracks - backtracks_remaining
+        return ""
+
+    def _restore_state(self, target: AgentState, snapshot: AgentState) -> None:
+        preserved_attempts = target.attempts
+        preserved_results = list(target.verifier_results)
+        for field in AgentState.model_fields:
+            setattr(target, field, getattr(snapshot, field))
+        target.attempts = preserved_attempts
+        target.verifier_results = preserved_results
+
+    def _assess_proposals(self, state: AgentState) -> list[ProposalAssessment]:
+        proposals = self._propose(state)
+        assessments: list[ProposalAssessment] = []
+        for proposal in proposals:
+            results = [verifier.verify(proposal, state) for verifier in self.verifiers]
+            assessments.append(ProposalAssessment(proposal=proposal, results=results))
+        return assessments
+
+    def _propose(self, state: AgentState) -> list[Proposal]:
+        proposals: list[Proposal] = []
+        for index in range(self.proposal_count):
+            prompt = self._proposal_prompt(state, index)
+            response = self.model.chat([{"role": "user", "content": prompt}], tools=None)
+            raw = response.final_text or ""
+            proposals.append(self._parse_proposal(raw, index))
+        return proposals
+
+    def _proposal_prompt(self, state: AgentState, index: int) -> str:
+        constraints = "\n".join(state.constraints) if state.constraints else "none"
+        plan = state.current_plan or "none"
+        history = "\n".join(state.history) if state.history else "none"
+        payload = {
+            "task": state.task,
+            "constraints": constraints,
+            "plan": plan,
+            "history": history,
+            "proposal_index": index,
+            "seed": self.seed,
+            "instruction": "Respond with JSON: {\"action\": str, \"rationale\": str}.",
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _parse_proposal(self, text: str, index: int) -> Proposal:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return Proposal(action=text, rationale="model output not JSON")
+        action = data.get("action") if isinstance(data, dict) else None
+        rationale = data.get("rationale") if isinstance(data, dict) else None
+        if not action:
+            action = text
+        if not rationale:
+            rationale = f"proposal {index}"
+        return Proposal(action=str(action), rationale=str(rationale))
+
+    def _rank_assessments(
+        self, assessments: list[ProposalAssessment], state: AgentState
+    ) -> list[ProposalAssessment]:
+        scored = [
+            (self._score(item.proposal, state), idx, item)
+            for idx, item in enumerate(assessments)
+        ]
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [item[2] for item in scored]
+
+    def _score(self, proposal: Proposal, state: AgentState) -> int:
+        score = 0
+        score += self._preference_score(proposal, state)
+        score += self._plan_score(proposal, state)
+        return score
+
+    def _preference_score(self, proposal: Proposal, state: AgentState) -> int:
+        score = 0
+        for constraint in state.constraints:
+            rule, detail = _split_constraint(constraint)
+            if rule == "prefer" and detail and detail in proposal.action:
+                score += 1
+        return score
+
+    def _plan_score(self, proposal: Proposal, state: AgentState) -> int:
+        if not state.current_plan:
+            return 0
+        steps = [step.strip() for step in state.current_plan.split(";") if step.strip()]
+        completed = set()
+        for entry in state.history:
+            for step in steps:
+                if step and step in entry:
+                    completed.add(step)
+        for step in steps:
+            if step not in completed and step in proposal.action:
+                return 1
+        return 0
+
+
+def _split_constraint(constraint: str) -> tuple[str, str]:
+    if ":" in constraint:
+        prefix, detail = constraint.split(":", 1)
+        return prefix.strip(), detail.strip()
+    return "must", constraint.strip()

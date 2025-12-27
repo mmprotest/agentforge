@@ -1,0 +1,8 @@
+{
+  "task": "Return a JSON object with a single key 'answer' set to 'hello'.",
+  "constraints": ["must:hello"],
+  "require_json": true,
+  "output_schema": {
+    "required": ["answer"]
+  }
+}
