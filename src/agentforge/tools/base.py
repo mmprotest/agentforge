@@ -21,7 +21,7 @@ class Tool(ABC):
     output_schema: type[BaseModel] | None = None
 
     @abstractmethod
-    def run(self, data: BaseModel) -> ToolResult:
+    def run(self, data: BaseModel | dict[str, Any]) -> ToolResult:
         """Execute the tool."""
         raise NotImplementedError
 

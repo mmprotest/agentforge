@@ -20,3 +20,16 @@ def test_trim_messages_keeps_recent_user_and_tool_summaries():
     assert "tool three" in contents
     total_chars = sum(len(str(msg["content"])) for msg in trimmed)
     assert total_chars <= 80
+
+
+def test_trim_messages_allows_old_system_messages_to_drop():
+    messages = [
+        {"role": "system", "content": "initial system"},
+        {"role": "system", "content": "routing note"},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    trimmed = trim_messages(messages, max_chars=30, max_turns=4)
+    contents = [msg["content"] for msg in trimmed]
+    assert "initial system" in contents
+    assert "routing note" not in contents

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel
 
 from agentforge.tools.base import Tool, ToolResult
@@ -18,7 +20,7 @@ class UnitConvertTool(Tool):
     description = "Convert between common units of length, mass, temperature, and time."
     input_schema = UnitConvertInput
 
-    def run(self, data: BaseModel) -> ToolResult:
+    def run(self, data: BaseModel | dict[str, Any]) -> ToolResult:
         payload = UnitConvertInput.model_validate(data)
         value = payload.value
         from_unit = payload.from_unit.lower()

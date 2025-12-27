@@ -20,7 +20,7 @@ from agentforge.protocol import (
     protocol_from_payload,
 )
 from agentforge.memory import MemoryStore
-from agentforge.routing import is_code_task, suggest_tool
+from agentforge.routing import is_code_task, should_enable_tools, suggest_tool, tool_candidates
 from agentforge.safety.policy import SafetyPolicy
 from agentforge.trace import TraceRecorder
 from agentforge.tools.base import Tool
@@ -112,6 +112,9 @@ class Agent:
 
     def run(self, query: str) -> AgentResult:
         logger.info("Agent run started (mode=%s, verify=%s).", self.mode, self.verify)
+        self._model_calls = 0
+        self._tool_calls = 0
+        self._pending_tool_call_response = None
         if self.self_consistency > 1:
             candidates: list[AgentResult] = []
             for index in range(self.self_consistency):
@@ -142,7 +145,6 @@ class Agent:
         logger.info("User query: %s", redact(query))
         self.tools_used = []
         self.tools_created = []
-        self._tool_calls = 0
         self.memory = MemoryStore(
             max_tool_output_chars=self.memory.max_tool_output_chars,
             keep_raw_tool_output=self.memory.keep_raw_tool_output,
@@ -155,7 +157,10 @@ class Agent:
             "Respond with JSON only, using either "
             '{"type":"tool","name":"<tool>","arguments":{...}} '
             'or {"type":"final","answer":"...","confidence":0.0,"checks":[...]} '
-            "Do not reveal chain-of-thought."
+            "Do not reveal chain-of-thought.\n"
+            "Examples:\n"
+            'Tool: {"type":"tool","name":"calculator","arguments":{"expression":"2+2"}}\n'
+            'Final: {"type":"final","answer":"4","confidence":0.9,"checks":["basic arithmetic"]}'
         )
         if self.strict_json_mode:
             system_prompt += (
@@ -169,12 +174,40 @@ class Agent:
         if self.trace:
             self.trace.record_messages(self._messages)
 
+        tools_enabled, tools_reason = should_enable_tools(query)
+        if not tools_enabled:
+            for tool in self.registry.list():
+                if re.search(rf"\b{re.escape(tool.name)}\b", query, re.IGNORECASE):
+                    tools_enabled = True
+                    tools_reason = "explicit_tool_name"
+                    break
+        if not tools_enabled:
+            logger.info("Controller disabled tools (%s).", tools_reason)
+            self._append_message(
+                {
+                    "role": "system",
+                    "content": (
+                        "Controller decision: tools disabled. Answer directly without "
+                        "calling tools."
+                    ),
+                }
+            )
+
+        candidates = tool_candidates(query) if tools_enabled else []
+        ambiguous_tools = False
+        if len(candidates) > 1:
+            sorted_candidates = sorted(
+                candidates, key=lambda candidate: candidate.confidence, reverse=True
+            )
+            if sorted_candidates[0].confidence - sorted_candidates[1].confidence <= 0.15:
+                ambiguous_tools = True
+
         used_router = False
         format_retry_remaining = 1 if self.strict_json_mode else 0
         code_check_enabled = self.code_check and is_code_task(query)
         remaining_steps = self.max_steps
-        remaining_tool_calls = self.max_tool_calls
-        remaining_model_calls = self.max_model_calls
+        remaining_tool_calls = max(0, self.max_tool_calls - self._tool_calls)
+        remaining_model_calls = max(0, self.max_model_calls - self._model_calls)
         logger.info(
             "Limits: steps=%s, model_calls=%s, tool_calls=%s",
             remaining_steps,
@@ -191,11 +224,14 @@ class Agent:
                 remaining_model_calls,
                 remaining_tool_calls,
             )
-            suggestion = suggest_tool(query) if not used_router else None
+            suggestion = (
+                suggest_tool(query) if not used_router and tools_enabled else None
+            )
             if (
                 suggestion
                 and suggestion.confidence >= 0.8
                 and remaining_tool_calls > 0
+                and tools_enabled
             ):
                 direct_args = self._direct_tool_args(suggestion.tool_name, query)
                 if direct_args is not None:
@@ -208,7 +244,14 @@ class Agent:
                         )
                         output, ok, schema_error = self._execute_tool(tool, direct_args)
                         self._handle_tool_result(
-                            suggestion.tool_name, output, None, direct_args
+                            suggestion.tool_name,
+                            output,
+                            None,
+                            direct_args,
+                            message_role="system",
+                            explanation=(
+                                "Router auto-executed a tool based on the request."
+                            ),
                         )
                         used_router = True
                         if schema_error:
@@ -239,7 +282,7 @@ class Agent:
                     }
                 )
                 used_router = True
-            tools = self.registry.openai_schemas()
+            tools = self.registry.openai_schemas() if tools_enabled else None
             if remaining_model_calls <= 0:
                 return AgentResult(
                     answer="Reached model call limit",
@@ -289,6 +332,7 @@ class Agent:
                 tool_call = self._parse_tool_call_from_text(response.final_text)
                 if tool_call is not None:
                     response = response.model_copy(update={"tool_call": tool_call})
+            protocol_tool_call = isinstance(protocol, ProtocolToolCall)
             if response.final_text is not None and isinstance(protocol, ProtocolFinal):
                 answer = format_final(protocol.answer, protocol.checks)
                 if code_check_enabled:
@@ -302,32 +346,25 @@ class Agent:
                     confidence=protocol.confidence,
                     trace_path=self._finalize_trace(),
                 )
-            if (
-                response.final_text is not None
-                and response.tool_call is None
-                and isinstance(protocol, ProtocolToolCall)
-            ):
-                if self.policy.tool_vote_enabled:
-                    before_calls = self._model_calls
-                    self._pending_tool_call_response = response
-                    elected = self._elect_tool_call(tools)
-                    remaining_model_calls -= self._model_calls - before_calls
-                    if elected is None:
+            if response.final_text is not None and response.tool_call is None:
+                if protocol_tool_call:
+                    if remaining_model_calls <= 0:
                         return AgentResult(
                             answer="No valid tool call from model",
                             tools_used=self.tools_used,
                             tools_created=self.tools_created,
                             trace_path=self._finalize_trace(),
                         )
-                    response = response.model_copy(update={"tool_call": elected})
-                else:
-                    return AgentResult(
-                        answer="No valid tool call from model",
-                        tools_used=self.tools_used,
-                        tools_created=self.tools_created,
-                        trace_path=self._finalize_trace(),
+                    self._append_message(
+                        {
+                            "role": "system",
+                            "content": (
+                                "The tool call format was invalid. "
+                                "Respond with a valid tool call or a final answer."
+                            ),
+                        }
                     )
-            if response.final_text is not None and response.tool_call is None:
+                    continue
                 answer = response.final_text
                 if code_check_enabled:
                     answer = self._code_check_loop(answer)
@@ -339,25 +376,47 @@ class Agent:
                     trace_path=self._finalize_trace(),
                 )
             if response.tool_call is None:
-                return AgentResult(
-                    answer="No response from model",
-                    tools_used=self.tools_used,
-                    tools_created=self.tools_created,
-                    trace_path=self._finalize_trace(),
-                )
-            if self.policy.tool_vote_enabled:
-                before_calls = self._model_calls
-                self._pending_tool_call_response = response
-                elected = self._elect_tool_call(tools)
-                remaining_model_calls -= self._model_calls - before_calls
-                if elected is None:
+                if tools_enabled and ambiguous_tools:
+                    elected, remaining_model_calls = self._maybe_vote_tool_call(
+                        tools,
+                        response,
+                        remaining_model_calls,
+                        ambiguous=True,
+                    )
+                    if elected is not None:
+                        response = response.model_copy(update={"tool_call": elected})
+                    else:
+                        return AgentResult(
+                            answer="No response from model",
+                            tools_used=self.tools_used,
+                            tools_created=self.tools_created,
+                            trace_path=self._finalize_trace(),
+                        )
+                else:
                     return AgentResult(
-                        answer="No valid tool call from model",
+                        answer="No response from model",
                         tools_used=self.tools_used,
                         tools_created=self.tools_created,
                         trace_path=self._finalize_trace(),
                     )
-                response = response.model_copy(update={"tool_call": elected})
+            if not tools_enabled:
+                if remaining_model_calls <= 0:
+                    return AgentResult(
+                        answer="Tools disabled for this request",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
+                self._append_message(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Tools are disabled for this request. "
+                            "Answer directly without using tools."
+                        ),
+                    }
+                )
+                continue
             tool_name = response.tool_call.name
             if remaining_tool_calls <= 0:
                 return AgentResult(
@@ -367,30 +426,96 @@ class Agent:
                     trace_path=self._finalize_trace(),
                 )
             tool = self.registry.get(tool_name)
-            if tool is None:
-                return AgentResult(
-                    answer=f"Requested unknown tool: {tool_name}",
-                    tools_used=self.tools_used,
-                    tools_created=self.tools_created,
-                    trace_path=self._finalize_trace(),
+            if tool is None or not self.policy.is_tool_allowed(tool_name):
+                elected, remaining_model_calls = self._maybe_vote_tool_call(
+                    tools,
+                    response,
+                    remaining_model_calls,
+                    schema_error=True,
+                    ambiguous=ambiguous_tools,
                 )
-            if not self.policy.is_tool_allowed(tool_name):
-                return AgentResult(
-                    answer=f"Tool not allowed: {tool_name}",
-                    tools_used=self.tools_used,
-                    tools_created=self.tools_created,
-                    trace_path=self._finalize_trace(),
+                if elected is not None:
+                    response = response.model_copy(update={"tool_call": elected})
+                    tool_name = response.tool_call.name
+                    tool = self.registry.get(tool_name)
+                if tool is None:
+                    return AgentResult(
+                        answer=f"Requested unknown tool: {tool_name}",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
+                if not self.policy.is_tool_allowed(tool_name):
+                    return AgentResult(
+                        answer=f"Tool not allowed: {tool_name}",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
+            try:
+                validated_args = tool.input_schema.model_validate(
+                    response.tool_call.arguments
+                ).model_dump()
+            except ValidationError as exc:
+                elected, remaining_model_calls = self._maybe_vote_tool_call(
+                    tools,
+                    response,
+                    remaining_model_calls,
+                    schema_error=True,
+                    ambiguous=ambiguous_tools,
                 )
+                if elected is not None:
+                    response = response.model_copy(update={"tool_call": elected})
+                    tool_name = response.tool_call.name
+                    tool = self.registry.get(tool_name)
+                    if tool is None:
+                        return AgentResult(
+                            answer=f"Requested unknown tool: {tool_name}",
+                            tools_used=self.tools_used,
+                            tools_created=self.tools_created,
+                            trace_path=self._finalize_trace(),
+                        )
+                    if not self.policy.is_tool_allowed(tool_name):
+                        return AgentResult(
+                            answer=f"Tool not allowed: {tool_name}",
+                            tools_used=self.tools_used,
+                            tools_created=self.tools_created,
+                            trace_path=self._finalize_trace(),
+                        )
+                    try:
+                        validated_args = tool.input_schema.model_validate(
+                            response.tool_call.arguments
+                        ).model_dump()
+                    except ValidationError as exc2:
+                        output = self._tool_error_payload(tool, exc2, schema_error=True)
+                        self._handle_tool_result(
+                            tool_name,
+                            output,
+                            response.tool_call.id,
+                            response.tool_call.arguments,
+                        )
+                        self._append_schema_retry(tool, output)
+                        continue
+                else:
+                    output = self._tool_error_payload(tool, exc, schema_error=True)
+                    self._handle_tool_result(
+                        tool_name,
+                        output,
+                        response.tool_call.id,
+                        response.tool_call.arguments,
+                    )
+                    self._append_schema_retry(tool, output)
+                    continue
             logger.info(
                 "Tool call requested: %s args=%s",
                 tool_name,
-                redact(json.dumps(response.tool_call.arguments, ensure_ascii=False)),
+                redact(json.dumps(validated_args, ensure_ascii=False)),
             )
             output, ok, schema_error = self._execute_tool(
-                tool, response.tool_call.arguments
+                tool, validated_args
             )
             self._handle_tool_result(
-                tool_name, output, response.tool_call.id, response.tool_call.arguments
+                tool_name, output, response.tool_call.id, validated_args
             )
             if schema_error:
                 self._append_schema_retry(tool, output)
@@ -412,6 +537,8 @@ class Agent:
         output: Any,
         call_id: str | None = None,
         arguments: dict[str, Any] | None = None,
+        message_role: str = "tool",
+        explanation: str | None = None,
     ) -> None:
         if tool_name not in self.tools_used:
             self.tools_used.append(tool_name)
@@ -427,11 +554,18 @@ class Agent:
             "output": rendered_output,
         }
         content = json.dumps(payload, ensure_ascii=False, default=str)
-        tool_message = {
-            "role": "tool",
-            "tool_call_id": call_id or tool_name,
-            "content": content,
-        }
+        if message_role == "tool":
+            tool_message = {
+                "role": "tool",
+                "tool_call_id": call_id or tool_name,
+                "content": content,
+            }
+        else:
+            note = explanation or f"Auto-executed tool {tool_name}."
+            tool_message = {
+                "role": message_role,
+                "content": f"{note}\n{entry.summary}",
+            }
         self._append_message(tool_message)
         logger.info(
             "Tool result stored: %s summary=%s",
@@ -655,6 +789,29 @@ class Agent:
         if isinstance(protocol, ProtocolToolCall):
             return protocol_to_toolcall(protocol)
         return None
+
+    def _maybe_vote_tool_call(
+        self,
+        tools_schemas: list[dict[str, Any]] | None,
+        response: Any,
+        remaining_model_calls: int,
+        *,
+        schema_error: bool = False,
+        ambiguous: bool = False,
+    ) -> tuple["ToolCall" | None, int]:
+        if not self.policy.tool_vote_enabled:
+            return None, remaining_model_calls
+        if not (schema_error or ambiguous):
+            return None, remaining_model_calls
+        if not tools_schemas:
+            return None, remaining_model_calls
+        if remaining_model_calls <= 0:
+            return None, remaining_model_calls
+        before_calls = self._model_calls
+        self._pending_tool_call_response = response
+        elected = self._elect_tool_call(tools_schemas)
+        remaining_model_calls -= self._model_calls - before_calls
+        return elected, remaining_model_calls
 
     def _elect_tool_call(self, tools_schemas: list[dict[str, Any]]) -> "ToolCall" | None:
         from agentforge.models.base import ToolCall

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -30,7 +31,7 @@ class FileSystemTool(Tool):
             raise ValueError("Path traversal detected")
         return target
 
-    def run(self, data: BaseModel) -> ToolResult:
+    def run(self, data: BaseModel | dict[str, Any]) -> ToolResult:
         input_data = FileSystemInput.model_validate(data)
         target = self._safe_path(input_data.path)
         if input_data.action == "read":

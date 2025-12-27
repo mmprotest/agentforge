@@ -12,7 +12,7 @@ class SafetyPolicy:
     max_tool_creations: int = 1
     max_runtime_seconds: int = 60
     max_model_calls: int = 20
-    tool_vote_enabled: bool = True
+    tool_vote_enabled: bool = False
     tool_vote_k: int = 2
     tool_vote_max_samples: int = 7
     tool_vote_max_model_calls: int = 7

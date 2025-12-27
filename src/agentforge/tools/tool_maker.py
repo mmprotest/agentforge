@@ -115,7 +115,7 @@ class ToolMakerTool(Tool):
         self.maker = maker
         self.registry = registry
 
-    def run(self, data: BaseModel) -> ToolResult:
+    def run(self, data: BaseModel | dict[str, Any]) -> ToolResult:
         input_data = ToolMakerInput.model_validate(data)
         result = self.maker.create_tool(input_data.spec)
         output = {

@@ -19,7 +19,7 @@ class JsonRepairTool(Tool):
     description = "Repair and parse JSON-like strings."
     input_schema = JsonRepairInput
 
-    def run(self, data: BaseModel) -> ToolResult:
+    def run(self, data: BaseModel | dict[str, Any]) -> ToolResult:
         payload = JsonRepairInput.model_validate(data)
         try:
             repaired = repair_json(payload.text)

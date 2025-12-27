@@ -29,7 +29,7 @@ class CodeRunMultiTool(Tool):
         self.workspace_dir = Path(workspace_dir).resolve()
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
 
-    def run(self, data: BaseModel) -> ToolResult:
+    def run(self, data: BaseModel | dict[str, Any]) -> ToolResult:
         payload = CodeRunMultiInput.model_validate(data)
         run_dir = self.workspace_dir / "code_runs" / uuid4().hex
         run_dir.mkdir(parents=True, exist_ok=True)

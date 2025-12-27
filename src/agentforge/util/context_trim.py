@@ -43,16 +43,21 @@ def trim_messages(
         _truncate_tool_content(message, tool_max_chars)
 
     last_user_index = None
+    first_system_index = None
     tool_indices: list[int] = []
     for idx, message in enumerate(trimmed):
         role = message.get("role")
         if role == "user":
             last_user_index = idx
+        if role == "system" and first_system_index is None:
+            first_system_index = idx
         if role == "tool":
             tool_indices.append(idx)
     protected_indices = set()
     if last_user_index is not None:
         protected_indices.add(last_user_index)
+    if first_system_index is not None:
+        protected_indices.add(first_system_index)
     protected_indices.update(tool_indices[-2:])
 
     def over_budget(items: list[dict[str, Any]]) -> bool:
@@ -65,7 +70,8 @@ def trim_messages(
     removable_indices = [
         idx
         for idx, message in enumerate(trimmed)
-        if message.get("role") in _TURN_ROLES and idx not in protected_indices
+        if message.get("role") in _TURN_ROLES | {"system"}
+        and idx not in protected_indices
     ]
     while over_budget(trimmed) and removable_indices:
         drop_index = removable_indices.pop(0)

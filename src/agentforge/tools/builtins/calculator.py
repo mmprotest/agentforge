@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 from fractions import Fraction
 
+from typing import Any
+
 from pydantic import BaseModel
 
 from agentforge.tools.base import Tool, ToolResult
@@ -19,7 +21,7 @@ class CalculatorTool(Tool):
     description = "Evaluate arithmetic expressions with exact fractions."
     input_schema = CalculatorInput
 
-    def run(self, data: BaseModel) -> ToolResult:
+    def run(self, data: BaseModel | dict[str, Any]) -> ToolResult:
         payload = CalculatorInput.model_validate(data)
         value = _evaluate_expression(payload.expression)
         value_text = str(value.numerator // value.denominator) if value.denominator == 1 else str(value)

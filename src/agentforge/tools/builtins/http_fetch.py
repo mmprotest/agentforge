@@ -28,7 +28,7 @@ class HttpFetchTool(Tool):
     input_schema = HttpFetchInput
     output_schema = HttpFetchOutput
 
-    def run(self, data: BaseModel) -> ToolResult:
+    def run(self, data: BaseModel | dict[str, Any]) -> ToolResult:
         input_data = HttpFetchInput.model_validate(data)
         with httpx.Client(timeout=input_data.timeout_seconds) as client:
             response = client.get(input_data.url, headers=input_data.headers)
