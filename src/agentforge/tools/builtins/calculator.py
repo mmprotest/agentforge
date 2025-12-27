@@ -32,7 +32,8 @@ class CalculatorTool(Tool):
 
 
 def _evaluate_expression(expression: str) -> Fraction:
-    tree = ast.parse(expression, mode="eval")
+    normalized = expression.replace("^", "**")
+    tree = ast.parse(normalized, mode="eval")
     return _eval_node(tree.body)
 
 
