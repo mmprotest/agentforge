@@ -9,6 +9,22 @@ AgentForge is a production-ready Python 3.11+ repository that implements an agen
 - CLI and FastAPI server.
 - Eval harness with trace/replay support.
 
+## How the agent works
+```mermaid
+flowchart TD
+    User[User prompt] --> CLI[CLI or API request]
+    CLI --> Orchestrator[Agent orchestrator]
+    Orchestrator -->|Builds messages & system rules| Model[OpenAI-compatible model]
+    Model -->|Response: tool call or final answer| Orchestrator
+    Orchestrator --> Decision{Tool call?}
+    Decision -->|Yes| ToolGate[Tool registry + validation]
+    ToolGate --> Sandbox[Sandbox / workspace tools]
+    Sandbox --> ToolResult[Tool output]
+    ToolResult --> Orchestrator
+    Decision -->|No| Final[Final response]
+    Orchestrator --> Final
+```
+
 ## Quickstart
 
 ### Install
