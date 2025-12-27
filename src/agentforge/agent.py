@@ -84,6 +84,7 @@ class Agent:
         self.tools_created: list[str] = []
         self._model_calls = 0
         self._tool_calls = 0
+        self._pending_tool_call_response = None
 
     def _internal_plan(self, query: str) -> None:
         if self.mode != "deep":
@@ -180,8 +181,6 @@ class Agent:
                     tool = self.registry.get(suggestion.tool_name)
                     if tool and self.policy.is_tool_allowed(suggestion.tool_name):
                         output, ok, schema_error = self._execute_tool(tool, direct_args)
-                        remaining_tool_calls -= 1
-                        self._tool_calls += 1
                         self._handle_tool_result(
                             suggestion.tool_name, output, None, direct_args
                         )
@@ -189,6 +188,8 @@ class Agent:
                         if schema_error:
                             self._append_schema_retry(tool, output)
                             continue
+                        remaining_tool_calls -= 1
+                        self._tool_calls += 1
                         if ok is False:
                             continue
                         if remaining_model_calls > 0:
@@ -247,8 +248,10 @@ class Agent:
                         tools_created=self.tools_created,
                         trace_path=self._finalize_trace(),
                     )
-            if response.tool_call is None and isinstance(protocol, ProtocolToolCall):
-                response = response.model_copy(update={"tool_call": protocol_to_toolcall(protocol)})
+            if response.tool_call is None and response.final_text:
+                tool_call = self._parse_tool_call_from_text(response.final_text)
+                if tool_call is not None:
+                    response = response.model_copy(update={"tool_call": tool_call})
             if response.final_text is not None and isinstance(protocol, ProtocolFinal):
                 answer = format_final(protocol.answer, protocol.checks)
                 if code_check_enabled:
@@ -261,6 +264,31 @@ class Agent:
                     confidence=protocol.confidence,
                     trace_path=self._finalize_trace(),
                 )
+            if (
+                response.final_text is not None
+                and response.tool_call is None
+                and isinstance(protocol, ProtocolToolCall)
+            ):
+                if self.policy.tool_vote_enabled:
+                    before_calls = self._model_calls
+                    self._pending_tool_call_response = response
+                    elected = self._elect_tool_call(tools)
+                    remaining_model_calls -= self._model_calls - before_calls
+                    if elected is None:
+                        return AgentResult(
+                            answer="No valid tool call from model",
+                            tools_used=self.tools_used,
+                            tools_created=self.tools_created,
+                            trace_path=self._finalize_trace(),
+                        )
+                    response = response.model_copy(update={"tool_call": elected})
+                else:
+                    return AgentResult(
+                        answer="No valid tool call from model",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
             if response.final_text is not None and response.tool_call is None:
                 answer = response.final_text
                 if code_check_enabled:
@@ -278,6 +306,19 @@ class Agent:
                     tools_created=self.tools_created,
                     trace_path=self._finalize_trace(),
                 )
+            if self.policy.tool_vote_enabled:
+                before_calls = self._model_calls
+                self._pending_tool_call_response = response
+                elected = self._elect_tool_call(tools)
+                remaining_model_calls -= self._model_calls - before_calls
+                if elected is None:
+                    return AgentResult(
+                        answer="No valid tool call from model",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
+                response = response.model_copy(update={"tool_call": elected})
             tool_name = response.tool_call.name
             if remaining_tool_calls <= 0:
                 return AgentResult(
@@ -304,14 +345,14 @@ class Agent:
             output, ok, schema_error = self._execute_tool(
                 tool, response.tool_call.arguments
             )
-            remaining_tool_calls -= 1
-            self._tool_calls += 1
             self._handle_tool_result(
                 tool_name, output, response.tool_call.id, response.tool_call.arguments
             )
             if schema_error:
                 self._append_schema_retry(tool, output)
                 continue
+            remaining_tool_calls -= 1
+            self._tool_calls += 1
             if ok is False:
                 continue
         return AgentResult(
@@ -473,7 +514,7 @@ class Agent:
         if getattr(tool, "input_schema", None) is not None:
             schema = tool.input_schema.model_json_schema()
             if schema_error:
-                example = self._schema_example(schema)
+                example = self._schema_example(schema, tool.name)
         return {
             "ok": False,
             "tool": tool.name,
@@ -484,7 +525,9 @@ class Agent:
             "hint": "Fix arguments and retry",
         }
 
-    def _schema_example(self, schema: dict[str, Any]) -> dict[str, Any]:
+    def _schema_example(self, schema: dict[str, Any], tool_name: str | None = None) -> dict[str, Any]:
+        if tool_name == "python_sandbox":
+            return {"code": "print(1)", "timeout_seconds": 2}
         properties = schema.get("properties", {})
         required = schema.get("required", [])
         example: dict[str, Any] = {}
@@ -518,16 +561,14 @@ class Agent:
     def _append_schema_retry(self, tool: Tool, output: dict[str, Any]) -> None:
         schema = output.get("expected_input_schema")
         example = output.get("example")
-        error = output.get("error", "Schema validation failed")
         self._append_message(
             {
                 "role": "system",
                 "content": (
-                    f"Tool call failed schema validation for '{tool.name}'.\n"
-                    f"Validation error: {error}\n"
-                    f"Required schema: {json.dumps(schema, ensure_ascii=False)}\n"
-                    f"Minimal valid example: {json.dumps(example, ensure_ascii=False)}\n"
-                    "Retry the same tool call with corrected arguments."
+                    "The previous tool call was invalid. Retry the SAME tool with "
+                    "arguments matching this schema.\n"
+                    f"Expected input schema: {json.dumps(schema, ensure_ascii=False)}\n"
+                    f"Minimal valid example arguments: {json.dumps(example, ensure_ascii=False)}"
                 ),
             }
         )
@@ -548,6 +589,95 @@ class Agent:
         if not isinstance(payload, dict):
             return None
         return protocol_from_payload(payload)
+
+    def _parse_tool_call_from_text(self, content: str) -> "ToolCall" | None:
+        try:
+            payload = json.loads(content.strip())
+        except json.JSONDecodeError:
+            if self.policy.red_flag_strict_json:
+                return None
+            try:
+                payload = repair_json(content)
+            except JsonRepairError:
+                return None
+        if not isinstance(payload, dict):
+            return None
+        protocol = protocol_from_payload(payload)
+        if isinstance(protocol, ProtocolToolCall):
+            return protocol_to_toolcall(protocol)
+        return None
+
+    def _elect_tool_call(self, tools_schemas: list[dict[str, Any]]) -> "ToolCall" | None:
+        from agentforge.models.base import ToolCall
+
+        max_samples = min(
+            self.policy.tool_vote_max_samples, self.policy.tool_vote_max_model_calls
+        )
+        pending_response = getattr(self, "_pending_tool_call_response", None)
+        if pending_response is not None:
+            self._pending_tool_call_response = None
+        remaining_calls = max(0, self.max_model_calls - self._model_calls)
+        if pending_response is None:
+            max_samples = min(max_samples, remaining_calls)
+        else:
+            max_samples = min(max_samples, remaining_calls + 1)
+        if max_samples <= 0:
+            return None
+        votes: dict[tuple[str, str], int] = {}
+        candidates: dict[tuple[str, str], ToolCall] = {}
+        for sample_idx in range(max_samples):
+            if pending_response is not None:
+                response = pending_response
+                pending_response = None
+            else:
+                if remaining_calls <= 0:
+                    break
+                response = self.model.chat(self._messages, tools=tools_schemas)
+                self._model_calls += 1
+                remaining_calls -= 1
+                if self.trace:
+                    tool_payload = (
+                        response.tool_call.model_dump()
+                        if response.tool_call is not None
+                        else None
+                    )
+                    self.trace.record_model_response(response.final_text, tool_payload)
+            raw_text = response.final_text
+            if raw_text and len(raw_text) > self.policy.red_flag_max_tool_call_chars:
+                continue
+            tool_call = response.tool_call
+            if tool_call is None and raw_text:
+                tool_call = self._parse_tool_call_from_text(raw_text)
+            if tool_call is None:
+                continue
+            tool = self.registry.get(tool_call.name)
+            if tool is None:
+                continue
+            if not self.policy.is_tool_allowed(tool_call.name):
+                continue
+            if not isinstance(tool_call.arguments, dict):
+                continue
+            try:
+                validated = tool.input_schema.model_validate(tool_call.arguments)
+            except ValidationError:
+                continue
+            arguments = validated.model_dump()
+            key = (
+                tool_call.name,
+                json.dumps(arguments, sort_keys=True, separators=(",", ":")),
+            )
+            votes[key] = votes.get(key, 0) + 1
+            if key not in candidates:
+                candidates[key] = ToolCall(name=tool_call.name, arguments=arguments)
+            counts = sorted(votes.values(), reverse=True)
+            top_count = counts[0]
+            second_count = counts[1] if len(counts) > 1 else 0
+            if top_count - second_count >= self.policy.tool_vote_k:
+                break
+        if not votes:
+            return None
+        winning_key = max(votes, key=votes.get)
+        return candidates[winning_key]
 
     def _code_check_loop(self, answer: str) -> str:
         current_answer = answer
