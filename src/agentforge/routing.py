@@ -15,7 +15,12 @@ class RouteSuggestion:
 
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _ARITH_RE = re.compile(r"[\d\)][\s]*[+\-*/][\s]*[\d\(]")
-_CONVERT_RE = re.compile(r"\bconvert\b|\bto\b", re.IGNORECASE)
+_CONVERT_RE = re.compile(
+    r"\bconvert\s+\d+(?:\.\d+)?\s*[a-zA-Z]+\s+to\s+[a-zA-Z]+\b"
+    r"|"
+    r"\b\d+(?:\.\d+)?\s*[a-zA-Z]+\s+to\s+[a-zA-Z]+\b",
+    re.IGNORECASE,
+)
 _JSON_RE = re.compile(r"\bjson\b|\bparse\b|\brepair\b", re.IGNORECASE)
 _REGEX_RE = re.compile(r"\bregex\b|\bextract\b", re.IGNORECASE)
 _CODE_RE = re.compile(r"\bpython\b|\bpytest\b|\bcode\b|\brun\b", re.IGNORECASE)
