@@ -28,6 +28,10 @@ from agentforge.tools.builtins.deep_think import DeepThinkTool
 from agentforge.tools.registry import ToolRegistry
 from agentforge.util.context_trim import trim_messages
 from agentforge.util.json_repair import JsonRepairError, repair_json
+from agentforge.util.logging import get_logger, redact
+
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -107,6 +111,7 @@ class Agent:
             )
 
     def run(self, query: str) -> AgentResult:
+        logger.info("Agent run started (mode=%s, verify=%s).", self.mode, self.verify)
         if self.self_consistency > 1:
             candidates: list[AgentResult] = []
             for index in range(self.self_consistency):
@@ -133,6 +138,8 @@ class Agent:
         return result
 
     def _run_once(self, query: str, nonce: str | None = None) -> AgentResult:
+        logger.info("New agent run (nonce=%s).", nonce or "none")
+        logger.info("User query: %s", redact(query))
         self.tools_used = []
         self.tools_created = []
         self._tool_calls = 0
@@ -168,8 +175,22 @@ class Agent:
         remaining_steps = self.max_steps
         remaining_tool_calls = self.max_tool_calls
         remaining_model_calls = self.max_model_calls
+        logger.info(
+            "Limits: steps=%s, model_calls=%s, tool_calls=%s",
+            remaining_steps,
+            remaining_model_calls,
+            remaining_tool_calls,
+        )
         while remaining_steps > 0:
             remaining_steps -= 1
+            step_index = self.max_steps - remaining_steps
+            logger.info(
+                "Step %s/%s (remaining model_calls=%s, tool_calls=%s).",
+                step_index,
+                self.max_steps,
+                remaining_model_calls,
+                remaining_tool_calls,
+            )
             suggestion = suggest_tool(query) if not used_router else None
             if (
                 suggestion
@@ -180,6 +201,11 @@ class Agent:
                 if direct_args is not None:
                     tool = self.registry.get(suggestion.tool_name)
                     if tool and self.policy.is_tool_allowed(suggestion.tool_name):
+                        logger.info(
+                            "Router direct tool call: %s args=%s",
+                            suggestion.tool_name,
+                            redact(json.dumps(direct_args, ensure_ascii=False)),
+                        )
                         output, ok, schema_error = self._execute_tool(tool, direct_args)
                         self._handle_tool_result(
                             suggestion.tool_name, output, None, direct_args
@@ -201,6 +227,11 @@ class Agent:
                             trace_path=self._finalize_trace(),
                         )
             if suggestion and not used_router:
+                logger.info(
+                    "Router suggested tool: %s (%s)",
+                    suggestion.tool_name,
+                    suggestion.reason,
+                )
                 self._append_message(
                     {
                         "role": "system",
@@ -216,9 +247,15 @@ class Agent:
                     tools_created=self.tools_created,
                     trace_path=self._finalize_trace(),
                 )
+            logger.info("Calling model (call #%s).", self._model_calls + 1)
             response = self.model.chat(self._messages, tools=tools)
             self._model_calls += 1
             remaining_model_calls -= 1
+            logger.info(
+                "Model response: final_text=%s tool_call=%s",
+                bool(response.final_text),
+                response.tool_call.name if response.tool_call else "none",
+            )
             if self.trace:
                 tool_payload = (
                     response.tool_call.model_dump()
@@ -256,6 +293,7 @@ class Agent:
                 answer = format_final(protocol.answer, protocol.checks)
                 if code_check_enabled:
                     answer = self._code_check_loop(answer)
+                logger.info("Returning final answer from protocol.")
                 return AgentResult(
                     answer=answer,
                     tools_used=self.tools_used,
@@ -293,6 +331,7 @@ class Agent:
                 answer = response.final_text
                 if code_check_enabled:
                     answer = self._code_check_loop(answer)
+                logger.info("Returning final answer.")
                 return AgentResult(
                     answer=answer,
                     tools_used=self.tools_used,
@@ -342,6 +381,11 @@ class Agent:
                     tools_created=self.tools_created,
                     trace_path=self._finalize_trace(),
                 )
+            logger.info(
+                "Tool call requested: %s args=%s",
+                tool_name,
+                redact(json.dumps(response.tool_call.arguments, ensure_ascii=False)),
+            )
             output, ok, schema_error = self._execute_tool(
                 tool, response.tool_call.arguments
             )
@@ -389,6 +433,11 @@ class Agent:
             "content": content,
         }
         self._append_message(tool_message)
+        logger.info(
+            "Tool result stored: %s summary=%s",
+            tool_name,
+            redact(entry.summary),
+        )
         if self.trace:
             if arguments is not None:
                 self.trace.record_tool_call(tool_name, arguments)
@@ -682,6 +731,7 @@ class Agent:
     def _code_check_loop(self, answer: str) -> str:
         current_answer = answer
         for attempt in range(self.code_check_max_iters):
+            logger.info("Code check attempt %s/%s.", attempt + 1, self.code_check_max_iters)
             code_blocks = self._extract_python_blocks(current_answer)
             if not code_blocks:
                 return current_answer
