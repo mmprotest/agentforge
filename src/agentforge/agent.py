@@ -52,6 +52,8 @@ class Agent:
         verify: bool = False,
         self_consistency: int = 1,
         max_model_calls: int | None = None,
+        max_steps: int | None = None,
+        max_tool_calls: int | None = None,
         memory: MemoryStore | None = None,
         trace: TraceRecorder | None = None,
         strict_json_mode: bool = False,
@@ -68,6 +70,8 @@ class Agent:
         self.verify = verify
         self.self_consistency = max(1, min(self_consistency, 3))
         self.max_model_calls = max_model_calls or self.policy.max_model_calls
+        self.max_steps = max_steps or self.policy.max_steps
+        self.max_tool_calls = max_tool_calls or self.policy.max_tool_calls
         self.memory = memory or MemoryStore()
         self.trace = trace
         self.strict_json_mode = strict_json_mode
@@ -79,6 +83,7 @@ class Agent:
         self.tools_used: list[str] = []
         self.tools_created: list[str] = []
         self._model_calls = 0
+        self._tool_calls = 0
 
     def _internal_plan(self, query: str) -> None:
         if self.mode != "deep":
@@ -129,6 +134,7 @@ class Agent:
     def _run_once(self, query: str, nonce: str | None = None) -> AgentResult:
         self.tools_used = []
         self.tools_created = []
+        self._tool_calls = 0
         self.memory = MemoryStore(
             max_tool_output_chars=self.memory.max_tool_output_chars,
             keep_raw_tool_output=self.memory.keep_raw_tool_output,
@@ -158,21 +164,41 @@ class Agent:
         used_router = False
         format_retry_remaining = 1 if self.strict_json_mode else 0
         code_check_enabled = self.code_check and is_code_task(query)
-        for _ in range(self.policy.max_tool_calls):
+        remaining_steps = self.max_steps
+        remaining_tool_calls = self.max_tool_calls
+        remaining_model_calls = self.max_model_calls
+        while remaining_steps > 0:
+            remaining_steps -= 1
             suggestion = suggest_tool(query) if not used_router else None
-            if suggestion and suggestion.confidence >= 0.8:
+            if (
+                suggestion
+                and suggestion.confidence >= 0.8
+                and remaining_tool_calls > 0
+            ):
                 direct_args = self._direct_tool_args(suggestion.tool_name, query)
                 if direct_args is not None:
                     tool = self.registry.get(suggestion.tool_name)
                     if tool and self.policy.is_tool_allowed(suggestion.tool_name):
-                        output, ok = self._execute_tool(tool, direct_args)
+                        output, ok, schema_error = self._execute_tool(tool, direct_args)
+                        remaining_tool_calls -= 1
+                        self._tool_calls += 1
                         self._handle_tool_result(
                             suggestion.tool_name, output, None, direct_args
                         )
                         used_router = True
+                        if schema_error:
+                            self._append_schema_retry(tool, output)
+                            continue
                         if ok is False:
                             continue
-                        continue
+                        if remaining_model_calls > 0:
+                            continue
+                        return AgentResult(
+                            answer="Reached model call limit",
+                            tools_used=self.tools_used,
+                            tools_created=self.tools_created,
+                            trace_path=self._finalize_trace(),
+                        )
             if suggestion and not used_router:
                 self._append_message(
                     {
@@ -182,10 +208,16 @@ class Agent:
                 )
                 used_router = True
             tools = self.registry.openai_schemas()
-            if self._model_calls >= self.max_model_calls:
-                break
+            if remaining_model_calls <= 0:
+                return AgentResult(
+                    answer="Reached model call limit",
+                    tools_used=self.tools_used,
+                    tools_created=self.tools_created,
+                    trace_path=self._finalize_trace(),
+                )
             response = self.model.chat(self._messages, tools=tools)
             self._model_calls += 1
+            remaining_model_calls -= 1
             if self.trace:
                 tool_payload = (
                     response.tool_call.model_dump()
@@ -247,6 +279,13 @@ class Agent:
                     trace_path=self._finalize_trace(),
                 )
             tool_name = response.tool_call.name
+            if remaining_tool_calls <= 0:
+                return AgentResult(
+                    answer="Reached tool call limit",
+                    tools_used=self.tools_used,
+                    tools_created=self.tools_created,
+                    trace_path=self._finalize_trace(),
+                )
             tool = self.registry.get(tool_name)
             if tool is None:
                 return AgentResult(
@@ -262,14 +301,21 @@ class Agent:
                     tools_created=self.tools_created,
                     trace_path=self._finalize_trace(),
                 )
-            output, ok = self._execute_tool(tool, response.tool_call.arguments)
+            output, ok, schema_error = self._execute_tool(
+                tool, response.tool_call.arguments
+            )
+            remaining_tool_calls -= 1
+            self._tool_calls += 1
             self._handle_tool_result(
                 tool_name, output, response.tool_call.id, response.tool_call.arguments
             )
+            if schema_error:
+                self._append_schema_retry(tool, output)
+                continue
             if ok is False:
                 continue
         return AgentResult(
-            answer="Reached tool call limit",
+            answer="Reached step limit",
             tools_used=self.tools_used,
             tools_created=self.tools_created,
             trace_path=self._finalize_trace(),
@@ -289,12 +335,13 @@ class Agent:
             if tool_created:
                 self.tools_created.append(tool_created)
         entry = self.memory.add_tool_output(tool_name, output)
-        is_error_payload = isinstance(output, dict) and output.get("ok") is False
-        content = (
-            json.dumps(output)
-            if is_error_payload
-            else json.dumps({"handle": entry.handle, "summary": entry.summary})
-        )
+        rendered_output = self._prepare_tool_output(output)
+        payload = {
+            "handle": entry.handle,
+            "summary": entry.summary,
+            "output": rendered_output,
+        }
+        content = json.dumps(payload, ensure_ascii=False, default=str)
         tool_message = {
             "role": "tool",
             "tool_call_id": call_id or tool_name,
@@ -305,6 +352,30 @@ class Agent:
             if arguments is not None:
                 self.trace.record_tool_call(tool_name, arguments)
             self.trace.record_tool_result(tool_name, entry.handle, entry.summary)
+
+    def _prepare_tool_output(self, output: Any) -> Any:
+        if output is None:
+            return None
+        budget = self.memory.max_tool_output_chars
+        try:
+            serialized = (
+                output
+                if isinstance(output, str)
+                else json.dumps(output, ensure_ascii=False, default=str)
+            )
+        except TypeError:
+            serialized = str(output)
+        total_chars = len(serialized)
+        if total_chars <= budget:
+            return output
+        head_len = budget // 2
+        tail_len = budget - head_len
+        return {
+            "truncated": True,
+            "total_chars": total_chars,
+            "head": serialized[:head_len],
+            "tail": serialized[-tail_len:] if tail_len > 0 else "",
+        }
 
     def _direct_tool_args(self, tool_name: str, query: str) -> dict[str, Any] | None:
         if tool_name == "calculator":
@@ -375,33 +446,91 @@ class Agent:
             return None
         stats = {
             "model_calls": self._model_calls,
-            "tool_calls": len(self.tools_used),
+            "tool_calls": self._tool_calls,
         }
         return self.trace.finalize(stats)
 
-    def _execute_tool(self, tool: Tool, arguments: dict[str, Any]) -> tuple[Any, bool]:
+    def _execute_tool(
+        self, tool: Tool, arguments: dict[str, Any]
+    ) -> tuple[Any, bool, bool]:
         try:
             result = tool.run(arguments)
             output = result.output
             ok = not (isinstance(output, dict) and output.get("ok") is False)
-            return output, ok
-        except (ValidationError, ValueError, TypeError, KeyError) as exc:
-            return self._tool_error_payload(tool, exc), False
+            return output, ok, False
+        except ValidationError as exc:
+            return self._tool_error_payload(tool, exc, schema_error=True), False, True
+        except (ValueError, TypeError, KeyError) as exc:
+            return self._tool_error_payload(tool, exc), False, False
         except Exception as exc:  # noqa: BLE001
-            return self._tool_error_payload(tool, exc), False
+            return self._tool_error_payload(tool, exc), False, False
 
-    def _tool_error_payload(self, tool: Tool, exc: Exception) -> dict[str, Any]:
+    def _tool_error_payload(
+        self, tool: Tool, exc: Exception, schema_error: bool = False
+    ) -> dict[str, Any]:
         schema = None
+        example = None
         if getattr(tool, "input_schema", None) is not None:
             schema = tool.input_schema.model_json_schema()
+            if schema_error:
+                example = self._schema_example(schema)
         return {
             "ok": False,
             "tool": tool.name,
             "error_type": exc.__class__.__name__,
             "error": str(exc),
             "expected_input_schema": schema,
+            "example": example,
             "hint": "Fix arguments and retry",
         }
+
+    def _schema_example(self, schema: dict[str, Any]) -> dict[str, Any]:
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        example: dict[str, Any] = {}
+        for name in required:
+            example[name] = self._example_value(properties.get(name, {}))
+        return example
+
+    def _example_value(self, schema: dict[str, Any]) -> Any:
+        if "default" in schema:
+            return schema["default"]
+        examples = schema.get("examples")
+        if examples:
+            return examples[0]
+        schema_type = schema.get("type")
+        if isinstance(schema_type, list):
+            schema_type = schema_type[0]
+        if schema_type == "string":
+            return "value"
+        if schema_type == "integer":
+            return 0
+        if schema_type == "number":
+            return 0
+        if schema_type == "boolean":
+            return False
+        if schema_type == "array":
+            return []
+        if schema_type == "object":
+            return {}
+        return None
+
+    def _append_schema_retry(self, tool: Tool, output: dict[str, Any]) -> None:
+        schema = output.get("expected_input_schema")
+        example = output.get("example")
+        error = output.get("error", "Schema validation failed")
+        self._append_message(
+            {
+                "role": "system",
+                "content": (
+                    f"Tool call failed schema validation for '{tool.name}'.\n"
+                    f"Validation error: {error}\n"
+                    f"Required schema: {json.dumps(schema, ensure_ascii=False)}\n"
+                    f"Minimal valid example: {json.dumps(example, ensure_ascii=False)}\n"
+                    "Retry the same tool call with corrected arguments."
+                ),
+            }
+        )
 
     def _parse_model_protocol(
         self, content: str

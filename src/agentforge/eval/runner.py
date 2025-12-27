@@ -74,7 +74,11 @@ def run_tasks(
         settings.max_model_calls = max_model_calls
     model = build_model(settings, use_mock=use_mock)
     registry = build_registry(settings, model)
-    policy = SafetyPolicy(max_model_calls=settings.max_model_calls)
+    policy = SafetyPolicy(
+        max_steps=settings.max_steps,
+        max_tool_calls=settings.max_tool_calls,
+        max_model_calls=settings.max_model_calls,
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with input_path.open("r", encoding="utf-8") as infile, output_path.open(
@@ -100,6 +104,8 @@ def run_tasks(
                 verify=verify,
                 self_consistency=self_consistency,
                 max_model_calls=settings.max_model_calls,
+                max_steps=settings.max_steps,
+                max_tool_calls=settings.max_tool_calls,
                 memory=memory,
                 trace=trace,
             )

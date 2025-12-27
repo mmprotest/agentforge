@@ -70,6 +70,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workspace", dest="workspace")
     parser.add_argument("--verify", action="store_true", dest="verify")
     parser.add_argument("--self-consistency", type=int, dest="self_consistency", default=1)
+    parser.add_argument("--max-steps", type=int, dest="max_steps")
+    parser.add_argument("--max-tool-calls", type=int, dest="max_tool_calls")
     parser.add_argument("--max-model-calls", type=int, dest="max_model_calls")
     parser.add_argument("--summary-lines", type=int, dest="summary_lines")
     parser.add_argument("--strict-json", action="store_true", dest="strict_json")
@@ -96,6 +98,10 @@ def apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
         data["workspace_dir"] = args.workspace
     if args.summary_lines:
         data["summary_lines"] = args.summary_lines
+    if args.max_steps:
+        data["max_steps"] = args.max_steps
+    if args.max_tool_calls:
+        data["max_tool_calls"] = args.max_tool_calls
     if args.max_model_calls:
         data["max_model_calls"] = args.max_model_calls
     if args.strict_json:
@@ -121,7 +127,11 @@ def main() -> None:
         keep_raw_tool_output=settings.keep_raw_tool_output,
         summary_lines=settings.summary_lines,
     )
-    policy = SafetyPolicy(max_model_calls=settings.max_model_calls)
+    policy = SafetyPolicy(
+        max_steps=settings.max_steps,
+        max_tool_calls=settings.max_tool_calls,
+        max_model_calls=settings.max_model_calls,
+    )
     agent = Agent(
         model=model,
         registry=registry,
@@ -130,6 +140,8 @@ def main() -> None:
         verify=args.verify,
         self_consistency=args.self_consistency,
         max_model_calls=settings.max_model_calls,
+        max_steps=settings.max_steps,
+        max_tool_calls=settings.max_tool_calls,
         memory=memory,
         strict_json_mode=settings.strict_json_mode,
         max_message_chars=settings.max_message_chars,

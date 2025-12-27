@@ -38,6 +38,8 @@ class RunRequest(BaseModel):
     model: str | None = None
     verify: bool | None = None
     self_consistency: int | None = None
+    max_steps: int | None = None
+    max_tool_calls: int | None = None
     max_model_calls: int | None = None
     summary_lines: int | None = None
     strict_json: bool | None = None
@@ -101,6 +103,10 @@ async def run_agent(request: RunRequest) -> RunResponse:
         settings.allow_tool_creation = request.allow_tool_creation
     if request.summary_lines is not None:
         settings.summary_lines = request.summary_lines
+    if request.max_steps is not None:
+        settings.max_steps = request.max_steps
+    if request.max_tool_calls is not None:
+        settings.max_tool_calls = request.max_tool_calls
     if request.max_model_calls is not None:
         settings.max_model_calls = request.max_model_calls
     if request.strict_json is not None:
@@ -120,7 +126,11 @@ async def run_agent(request: RunRequest) -> RunResponse:
         keep_raw_tool_output=settings.keep_raw_tool_output,
         summary_lines=settings.summary_lines,
     )
-    policy = SafetyPolicy(max_model_calls=settings.max_model_calls)
+    policy = SafetyPolicy(
+        max_steps=settings.max_steps,
+        max_tool_calls=settings.max_tool_calls,
+        max_model_calls=settings.max_model_calls,
+    )
     trace = TraceRecorder(trace_id=f"api-{uuid4().hex[:8]}", workspace_dir=settings.workspace_dir)
     agent = Agent(
         model=model,
@@ -130,6 +140,8 @@ async def run_agent(request: RunRequest) -> RunResponse:
         verify=bool(request.verify),
         self_consistency=request.self_consistency or 1,
         max_model_calls=settings.max_model_calls,
+        max_steps=settings.max_steps,
+        max_tool_calls=settings.max_tool_calls,
         memory=memory,
         trace=trace,
         strict_json_mode=settings.strict_json_mode,
