@@ -106,6 +106,10 @@ def should_enable_tools(query: str) -> tuple[bool, str]:
     normalized = query.strip()
     if not normalized:
         return False, "empty"
+    candidates = tool_candidates(normalized)
+    if candidates:
+        top_candidate = max(candidates, key=lambda candidate: candidate.confidence)
+        return True, f"candidate:{top_candidate.tool_name}"
     if _URL_RE.search(normalized):
         return True, "url"
     if _FILE_RE.search(normalized):
