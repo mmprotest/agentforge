@@ -68,4 +68,8 @@ def _apply_operator(op: ast.AST, left: Fraction, right: Fraction) -> Fraction:
         if right.denominator != 1:
             raise ValueError("Exponent must be integer")
         return left**int(right)
+    if isinstance(op, ast.BitXor):
+        if right.denominator != 1:
+            raise ValueError("Exponent must be integer")
+        return left**int(right)
     raise ValueError("Unsupported operator")

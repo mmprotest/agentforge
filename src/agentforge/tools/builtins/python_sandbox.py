@@ -44,12 +44,41 @@ class PythonSandboxTool(Tool):
             raise ValueError("Sandbox file access outside workspace")
         return open(target, mode, encoding="utf-8")
 
+    def _has_result_assignment(self, tree: ast.AST) -> bool:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                if any(isinstance(target, ast.Name) and target.id == "result" for target in node.targets):
+                    return True
+            if isinstance(node, ast.AnnAssign):
+                if isinstance(node.target, ast.Name) and node.target.id == "result":
+                    return True
+            if isinstance(node, ast.NamedExpr):
+                if isinstance(node.target, ast.Name) and node.target.id == "result":
+                    return True
+        return False
+
+    def _prepare_code(self, code: str) -> ast.AST:
+        tree = ast.parse(code)
+        if not tree.body:
+            return tree
+        if self._has_result_assignment(tree):
+            return tree
+        last_statement = tree.body[-1]
+        if isinstance(last_statement, ast.Expr):
+            assign = ast.Assign(
+                targets=[ast.Name(id="result", ctx=ast.Store())],
+                value=last_statement.value,
+            )
+            tree.body[-1] = assign
+            ast.fix_missing_locations(tree)
+        return tree
+
     def _run_code(self, code: str, output: multiprocessing.Queue) -> None:
         try:
             sanitized = sanitize_env(os.environ.copy())
             os.environ.clear()
             os.environ.update(sanitized)
-            self._validate_code(code)
+            compiled = compile(self._prepare_code(code), "<sandbox>", "exec")
             safe_builtins = {
                 "print": builtins.print,
                 "len": builtins.len,
@@ -63,7 +92,7 @@ class PythonSandboxTool(Tool):
             }
             globals_dict = {"__builtins__": safe_builtins}
             locals_dict: dict[str, Any] = {}
-            exec(code, globals_dict, locals_dict)
+            exec(compiled, globals_dict, locals_dict)
             result = locals_dict.get("result")
             output.put({"result": result, "error": None})
         except Exception as exc:  # noqa: BLE001
