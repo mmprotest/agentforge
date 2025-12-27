@@ -12,6 +12,12 @@ class SafetyPolicy:
     max_tool_creations: int = 1
     max_runtime_seconds: int = 60
     max_model_calls: int = 20
+    tool_vote_enabled: bool = True
+    tool_vote_k: int = 2
+    tool_vote_max_samples: int = 7
+    tool_vote_max_model_calls: int = 7
+    red_flag_strict_json: bool = True
+    red_flag_max_tool_call_chars: int = 8000
     allow_tools: list[str] | None = None
 
     def is_tool_allowed(self, name: str) -> bool:
