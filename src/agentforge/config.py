@@ -46,6 +46,8 @@ class Settings(BaseSettings):
         default=True, validation_alias="KEEP_RAW_TOOL_OUTPUT"
     )
     summary_lines: int = Field(default=10, validation_alias="SUMMARY_LINES")
+    max_steps: int = Field(default=20, validation_alias="MAX_STEPS")
+    max_tool_calls: int = Field(default=12, validation_alias="MAX_TOOL_CALLS")
     max_model_calls: int = Field(default=20, validation_alias="MAX_MODEL_CALLS")
     max_message_chars: int = Field(default=24000, validation_alias="MAX_MESSAGE_CHARS")
     max_turns: int = Field(default=20, validation_alias="MAX_TURNS")

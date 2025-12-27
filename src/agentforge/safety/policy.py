@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 @dataclass
 class SafetyPolicy:
+    max_steps: int = 20
     max_tool_calls: int = 6
     max_tool_creations: int = 1
     max_runtime_seconds: int = 60
