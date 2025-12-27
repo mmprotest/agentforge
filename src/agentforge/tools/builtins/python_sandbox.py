@@ -36,10 +36,7 @@ class PythonSandboxTool(Tool):
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
 
     def _validate_code(self, code: str) -> None:
-        tree = ast.parse(code)
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                raise ValueError("Imports are not allowed in sandbox")
+        ast.parse(code)
 
     def _safe_open(self, path: str, mode: str = "r"):
         target = (self.workspace_dir / path).resolve()
@@ -62,6 +59,7 @@ class PythonSandboxTool(Tool):
                 "max": builtins.max,
                 "sorted": builtins.sorted,
                 "open": self._safe_open,
+                "__import__": builtins.__import__,
             }
             globals_dict = {"__builtins__": safe_builtins}
             locals_dict: dict[str, Any] = {}
