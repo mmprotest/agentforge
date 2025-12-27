@@ -106,6 +106,10 @@ def should_enable_tools(query: str) -> tuple[bool, str]:
     normalized = query.strip()
     if not normalized:
         return False, "empty"
+    candidates = tool_candidates(normalized)
+    if candidates:
+        top_candidate = max(candidates, key=lambda candidate: candidate.confidence)
+        return True, f"candidate:{top_candidate.tool_name}"
     if _URL_RE.search(normalized):
         return True, "url"
     if _FILE_RE.search(normalized):
@@ -122,7 +126,4 @@ def should_enable_tools(query: str) -> tuple[bool, str]:
         return True, "json"
     if _REGEX_RE.search(normalized):
         return True, "regex"
-    word_count = len(re.findall(r"\w+", normalized))
-    if word_count <= 12:
-        return False, "short_closed_book"
-    return False, "no_signal"
+    return True, "default"
