@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 from agentforge.tools.base import Tool, ToolResult
@@ -23,7 +25,7 @@ class DeepThinkTool(Tool):
     input_schema = DeepThinkInput
     output_schema = DeepThinkOutput
 
-    def run(self, data: BaseModel) -> ToolResult:
+    def run(self, data: BaseModel | dict[str, Any]) -> ToolResult:
         input_data = DeepThinkInput.model_validate(data)
         plan = [
             "Identify key requirements",

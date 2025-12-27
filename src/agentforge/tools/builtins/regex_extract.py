@@ -21,7 +21,7 @@ class RegexExtractTool(Tool):
     description = "Extract regex matches and capture groups."
     input_schema = RegexExtractInput
 
-    def run(self, data: BaseModel) -> ToolResult:
+    def run(self, data: BaseModel | dict[str, Any]) -> ToolResult:
         payload = RegexExtractInput.model_validate(data)
         flags = _parse_flags(payload.flags)
         compiled = re.compile(payload.pattern, flags=flags)

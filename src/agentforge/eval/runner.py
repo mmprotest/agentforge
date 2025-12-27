@@ -8,54 +8,11 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from agentforge.agent import Agent
 from agentforge.config import Settings
-from agentforge.memory import MemoryStore
-from agentforge.models.mock import MockChatModel
-from agentforge.models.openai_compat import OpenAICompatChatModel
-from agentforge.safety.policy import SafetyPolicy
+from agentforge.factory import build_agent, build_model, build_registry
 from agentforge.trace import TraceRecorder
-from agentforge.tools.builtins.calculator import CalculatorTool
-from agentforge.tools.builtins.code_run_multi import CodeRunMultiTool
-from agentforge.tools.builtins.deep_think import DeepThinkTool
-from agentforge.tools.builtins.filesystem import FileSystemTool
-from agentforge.tools.builtins.http_fetch import HttpFetchTool
-from agentforge.tools.builtins.json_repair import JsonRepairTool
-from agentforge.tools.builtins.python_sandbox import PythonSandboxTool
-from agentforge.tools.builtins.regex_extract import RegexExtractTool
-from agentforge.tools.builtins.unit_convert import UnitConvertTool
+from agentforge.models.mock import MockChatModel
 from agentforge.tools.registry import ToolRegistry
-
-
-def build_registry(settings: Settings, model) -> ToolRegistry:
-    registry = ToolRegistry()
-    registry.register(HttpFetchTool())
-    registry.register(FileSystemTool(settings.workspace_dir))
-    registry.register(PythonSandboxTool(settings.workspace_dir))
-    registry.register(DeepThinkTool())
-    registry.register(CalculatorTool())
-    registry.register(RegexExtractTool())
-    registry.register(UnitConvertTool())
-    registry.register(CodeRunMultiTool(settings.workspace_dir))
-    registry.register(JsonRepairTool())
-    return registry
-
-
-def build_model(settings: Settings, use_mock: bool):
-    if use_mock or not settings.openai_api_key:
-        return MockChatModel()
-    extra_headers = None
-    if settings.openai_extra_headers:
-        extra_headers = json.loads(settings.openai_extra_headers)
-    return OpenAICompatChatModel(
-        base_url=settings.openai_base_url,
-        api_key=settings.openai_api_key,
-        model=settings.openai_model,
-        timeout_seconds=settings.openai_timeout_seconds,
-        extra_headers=extra_headers,
-        disable_tool_choice=settings.openai_disable_tool_choice,
-        force_chatcompletions_path=settings.openai_force_chatcompletions_path,
-    )
 
 
 def run_tasks(
@@ -73,12 +30,7 @@ def run_tasks(
     if max_model_calls is not None:
         settings.max_model_calls = max_model_calls
     model = build_model(settings, use_mock=use_mock)
-    registry = build_registry(settings, model)
-    policy = SafetyPolicy(
-        max_steps=settings.max_steps,
-        max_tool_calls=settings.max_tool_calls,
-        max_model_calls=settings.max_model_calls,
-    )
+    registry = build_registry(settings, model, include_tool_maker=False)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with input_path.open("r", encoding="utf-8") as infile, output_path.open(
@@ -91,22 +43,12 @@ def run_tasks(
             task_id = payload.get("id") or uuid4().hex
             query = payload.get("query", "")
             trace = TraceRecorder(trace_id=str(task_id), workspace_dir=settings.workspace_dir)
-            memory = MemoryStore(
-                max_tool_output_chars=settings.max_tool_output_chars,
-                keep_raw_tool_output=settings.keep_raw_tool_output,
-                summary_lines=settings.summary_lines,
-            )
-            agent = Agent(
-                model=model,
-                registry=registry,
-                policy=policy,
-                mode=settings.agent_mode,
+            agent = build_agent(
+                settings,
+                model,
+                registry,
                 verify=verify,
                 self_consistency=self_consistency,
-                max_model_calls=settings.max_model_calls,
-                max_steps=settings.max_steps,
-                max_tool_calls=settings.max_tool_calls,
-                memory=memory,
                 trace=trace,
             )
             result = agent.run(query)
@@ -172,7 +114,7 @@ def main() -> None:
         )
         return
     if args.command == "replay":
-        registry = build_registry(settings, MockChatModel())
+        registry = build_registry(settings, MockChatModel(), include_tool_maker=False)
         result = replay_trace(Path(args.trace), registry)
         print(json.dumps(result, indent=2))
 

@@ -46,7 +46,10 @@ class MemoryStore:
             return f"tool-{uuid4().hex[:12]}"
 
     def _summarize_output(self, tool_name: str, output: Any) -> str:
-        text = json.dumps(output, ensure_ascii=False, indent=2)
+        try:
+            text = json.dumps(output, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            text = str(output)
         clipped = text[: self.max_tool_output_chars]
         lines = [line.strip() for line in clipped.splitlines() if line.strip()]
         if not lines:

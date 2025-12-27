@@ -19,7 +19,7 @@ class DummyTool(Tool):
     description = "dummy tool"
     input_schema = DummyInput
 
-    def run(self, data: BaseModel) -> ToolResult:
+    def run(self, data: BaseModel | dict[str, int]) -> ToolResult:
         payload = DummyInput.model_validate(data)
         return ToolResult(output={"ok": True, "value": payload.value})
 
@@ -37,6 +37,7 @@ def test_tool_vote_skips_invalid_candidate():
     registry.register(DummyTool())
     policy = SafetyPolicy(
         max_model_calls=5,
+        tool_vote_enabled=True,
         tool_vote_k=1,
         tool_vote_max_samples=2,
         tool_vote_max_model_calls=2,
@@ -62,6 +63,7 @@ def test_red_flag_strict_json_discards_repaired_tool_calls():
     registry.register(DummyTool())
     policy = SafetyPolicy(
         max_model_calls=5,
+        tool_vote_enabled=True,
         tool_vote_k=1,
         tool_vote_max_samples=2,
         tool_vote_max_model_calls=2,
@@ -84,6 +86,7 @@ def test_tool_vote_stops_when_ahead_by_k():
     registry.register(DummyTool())
     policy = SafetyPolicy(
         max_model_calls=5,
+        tool_vote_enabled=True,
         tool_vote_k=2,
         tool_vote_max_samples=5,
         tool_vote_max_model_calls=5,

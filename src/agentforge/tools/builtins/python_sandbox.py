@@ -98,7 +98,7 @@ class PythonSandboxTool(Tool):
         except Exception as exc:  # noqa: BLE001
             output.put({"result": None, "error": str(exc)})
 
-    def run(self, data: BaseModel) -> ToolResult:
+    def run(self, data: BaseModel | dict[str, Any]) -> ToolResult:
         input_data = PythonSandboxInput.model_validate(data)
         output_queue: multiprocessing.Queue = multiprocessing.Queue()
         process = multiprocessing.Process(

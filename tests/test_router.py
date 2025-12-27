@@ -1,4 +1,4 @@
-from agentforge.routing import suggest_tool
+from agentforge.routing import should_enable_tools, suggest_tool
 
 
 def test_router_detects_url():
@@ -22,3 +22,15 @@ def test_router_detects_unit_convert():
 def test_router_ignores_generic_to_phrase():
     suggestion = suggest_tool("Please send this to the manager")
     assert suggestion is None
+
+
+def test_controller_disables_tools_for_short_closed_book():
+    enabled, reason = should_enable_tools("What is the capital of France?")
+    assert enabled is False
+    assert reason == "short_closed_book"
+
+
+def test_controller_enables_tools_for_file_path():
+    enabled, reason = should_enable_tools("Open README.md and summarize it.")
+    assert enabled is True
+    assert reason == "file"

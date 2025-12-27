@@ -3,60 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 from typing import Any
 
-from agentforge.agent import Agent
 from agentforge.config import Settings
-from agentforge.memory import MemoryStore
-from agentforge.models.mock import MockChatModel
-from agentforge.models.openai_compat import OpenAICompatChatModel
-from agentforge.safety.policy import SafetyPolicy
-from agentforge.tools.builtins.calculator import CalculatorTool
-from agentforge.tools.builtins.code_run_multi import CodeRunMultiTool
-from agentforge.tools.builtins.deep_think import DeepThinkTool
-from agentforge.tools.builtins.filesystem import FileSystemTool
-from agentforge.tools.builtins.http_fetch import HttpFetchTool
-from agentforge.tools.builtins.json_repair import JsonRepairTool
-from agentforge.tools.builtins.python_sandbox import PythonSandboxTool
-from agentforge.tools.builtins.regex_extract import RegexExtractTool
-from agentforge.tools.builtins.unit_convert import UnitConvertTool
-from agentforge.tools.registry import ToolRegistry
-from agentforge.tools.tool_maker import ToolMaker, ToolMakerTool
-
-
-def build_registry(settings: Settings, model) -> ToolRegistry:
-    registry = ToolRegistry()
-    registry.register(HttpFetchTool())
-    registry.register(FileSystemTool(settings.workspace_dir))
-    registry.register(PythonSandboxTool(settings.workspace_dir))
-    registry.register(DeepThinkTool())
-    registry.register(CalculatorTool())
-    registry.register(RegexExtractTool())
-    registry.register(UnitConvertTool())
-    registry.register(CodeRunMultiTool(settings.workspace_dir))
-    registry.register(JsonRepairTool())
-    if settings.allow_tool_creation:
-        maker = ToolMaker(model, settings.workspace_dir)
-        registry.register(ToolMakerTool(maker, registry))
-    return registry
-
-
-def build_model(settings: Settings):
-    if not settings.openai_api_key:
-        return MockChatModel()
-    extra_headers = None
-    if settings.openai_extra_headers:
-        extra_headers = json.loads(settings.openai_extra_headers)
-    return OpenAICompatChatModel(
-        base_url=settings.openai_base_url,
-        api_key=settings.openai_api_key,
-        model=settings.openai_model,
-        timeout_seconds=settings.openai_timeout_seconds,
-        extra_headers=extra_headers,
-        disable_tool_choice=settings.openai_disable_tool_choice,
-        force_chatcompletions_path=settings.openai_force_chatcompletions_path,
-    )
+from agentforge.factory import build_agent, build_model, build_registry
 
 
 def parse_args() -> argparse.Namespace:
@@ -122,33 +72,12 @@ def main() -> None:
     settings = apply_overrides(Settings(), args)
     model = build_model(settings)
     registry = build_registry(settings, model)
-    memory = MemoryStore(
-        max_tool_output_chars=settings.max_tool_output_chars,
-        keep_raw_tool_output=settings.keep_raw_tool_output,
-        summary_lines=settings.summary_lines,
-    )
-    policy = SafetyPolicy(
-        max_steps=settings.max_steps,
-        max_tool_calls=settings.max_tool_calls,
-        max_model_calls=settings.max_model_calls,
-    )
-    agent = Agent(
-        model=model,
-        registry=registry,
-        policy=policy,
-        mode=settings.agent_mode,
+    agent = build_agent(
+        settings,
+        model,
+        registry,
         verify=args.verify,
         self_consistency=args.self_consistency,
-        max_model_calls=settings.max_model_calls,
-        max_steps=settings.max_steps,
-        max_tool_calls=settings.max_tool_calls,
-        memory=memory,
-        strict_json_mode=settings.strict_json_mode,
-        max_message_chars=settings.max_message_chars,
-        max_turns=settings.max_turns,
-        trim_strategy=settings.trim_strategy,
-        code_check=settings.code_check,
-        code_check_max_iters=settings.code_check_max_iters,
     )
     result = agent.run(args.query)
     print("Tools used:", ", ".join(result.tools_used) or "none")
