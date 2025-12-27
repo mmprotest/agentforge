@@ -32,7 +32,8 @@ class CalculatorTool(Tool):
 
 
 def _evaluate_expression(expression: str) -> Fraction:
-    tree = ast.parse(expression, mode="eval")
+    normalized = expression.replace("^", "**")
+    tree = ast.parse(normalized, mode="eval")
     return _eval_node(tree.body)
 
 
@@ -65,6 +66,10 @@ def _apply_operator(op: ast.AST, left: Fraction, right: Fraction) -> Fraction:
     if isinstance(op, ast.Mod):
         return left % right
     if isinstance(op, ast.Pow):
+        if right.denominator != 1:
+            raise ValueError("Exponent must be integer")
+        return left**int(right)
+    if isinstance(op, ast.BitXor):
         if right.denominator != 1:
             raise ValueError("Exponent must be integer")
         return left**int(right)
