@@ -126,7 +126,4 @@ def should_enable_tools(query: str) -> tuple[bool, str]:
         return True, "json"
     if _REGEX_RE.search(normalized):
         return True, "regex"
-    word_count = len(re.findall(r"\w+", normalized))
-    if word_count <= 12:
-        return False, "short_closed_book"
-    return False, "no_signal"
+    return True, "default"
