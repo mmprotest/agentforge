@@ -39,6 +39,19 @@ pip install -e .[dev]
 python -m agentforge "Hello from mock mode"
 ```
 
+### CLI usage highlights
+```bash
+python -m agentforge "Draft a release note" --verify --self-consistency 3
+```
+
+Common flags:
+- `--mode {direct,deep}`: switch between direct and deep planning modes.
+- `--allow-tool-creation`: enable tool creation (also available via `ALLOW_TOOL_CREATION=true`).
+- `--workspace PATH`: override the workspace directory.
+- `--max-steps`, `--max-tool-calls`, `--max-model-calls`: bound the agent loop.
+- `--strict-json`, `--code-check`, `--code-check-max-iters`: tighten response formatting and validation.
+- `--max-message-chars`, `--max-turns`: control context budgeting.
+
 ### Use an OpenAI-compatible base URL
 ```bash
 export OPENAI_API_KEY=sk-your-key
