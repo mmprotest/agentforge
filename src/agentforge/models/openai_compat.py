@@ -128,6 +128,7 @@ class OpenAICompatChatModel(BaseChatModel):
         for attempt in range(3):
             try:
                 response = self._client.post(url, headers=headers, json=payload)
+                response.encoding = "utf-8"
                 if response.status_code in {429} or response.status_code >= 500:
                     raise OpenAICompatError(
                         f"Retryable error {response.status_code}: "
