@@ -204,6 +204,8 @@ class Agent:
                     ),
                 }
             )
+        elif tools_reason == "dynamic_info":
+            logger.info("Controller enabled tools (dynamic_info).")
 
         candidates = tool_candidates(query) if tools_enabled else []
         ambiguous_tools = False
@@ -216,6 +218,7 @@ class Agent:
 
         used_router = False
         format_retry_remaining = 1 if self.strict_json_mode else 0
+        tool_call_retry_used = False
         code_check_enabled = self.code_check and is_code_task(query)
         remaining_steps = self.max_steps
         remaining_tool_calls = max(0, self.max_tool_calls - self._tool_calls)
@@ -416,9 +419,16 @@ class Agent:
                         trace_path=self._finalize_trace(),
                     )
             if not tools_enabled:
+                if tool_call_retry_used:
+                    return AgentResult(
+                        answer="Tools are disabled and the model attempted a tool call again.",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
                 if remaining_model_calls <= 0:
                     return AgentResult(
-                        answer="Tools disabled for this request",
+                        answer="Tools are disabled and the model attempted a tool call.",
                         tools_used=self.tools_used,
                         tools_created=self.tools_created,
                         trace_path=self._finalize_trace(),
@@ -427,11 +437,13 @@ class Agent:
                     {
                         "role": "system",
                         "content": (
-                            "Tools are disabled for this request. "
-                            "Answer directly without using tools."
+                            "You are not allowed to use tools. If this question requires "
+                            "external or real-time information, state that explicitly "
+                            "instead of guessing."
                         ),
                     }
                 )
+                tool_call_retry_used = True
                 continue
             tool_name = response.tool_call.name
             if remaining_tool_calls <= 0:
