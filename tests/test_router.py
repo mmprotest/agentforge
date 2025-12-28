@@ -34,3 +34,9 @@ def test_controller_enables_tools_for_file_path():
     enabled, reason = should_enable_tools("Open README.md and summarize it.")
     assert enabled is True
     assert reason == "file"
+
+
+def test_controller_enables_tools_for_dynamic_info():
+    enabled, reason = should_enable_tools("Summarize the weather in Melbourne today")
+    assert enabled is True
+    assert reason == "dynamic_info"

@@ -15,6 +15,15 @@ class RouteSuggestion:
 
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _ARITH_RE = re.compile(r"[\d\)][\s]*[+\-*/][\s]*[\d\(]")
+_DYNAMIC_INFO_RE = re.compile(
+    r"\b("
+    r"weather|forecast|temperature|rain|humidity|wind|"
+    r"today|tomorrow|tonight|this week|current|now|right now|"
+    r"price|stock|market|exchange rate|btc|bitcoin|ethereum|"
+    r"news|headline|latest|score|result"
+    r")\b",
+    re.IGNORECASE,
+)
 _CONVERT_RE = re.compile(
     r"\bconvert\s+\d+(?:\.\d+)?\s*[a-zA-Z]+\s+to\s+[a-zA-Z]+\b"
     r"|"
@@ -110,13 +119,15 @@ def should_enable_tools(query: str) -> tuple[bool, str]:
     normalized = query.strip()
     if not normalized:
         return False, "empty"
+    if _DYNAMIC_INFO_RE.search(normalized):
+        return True, "dynamic_info"
     if _URL_RE.search(normalized):
         return True, "url"
     if _FILE_RE.search(normalized):
         return True, "file"
     if _TOOL_REQUEST_RE.search(normalized):
         return True, "explicit_tool_request"
-    if _CODE_RE.search(normalized) or _CODE_TASK_RE.search(normalized):
+    if _CODE_RE.search(normalized):
         return True, "code"
     if _ARITH_RE.search(normalized):
         return True, "math"
@@ -126,7 +137,6 @@ def should_enable_tools(query: str) -> tuple[bool, str]:
         return True, "json"
     if _REGEX_RE.search(normalized):
         return True, "regex"
-    is_multistep = bool(_MULTISTEP_RE.search(normalized))
-    if len(normalized) <= 160 and not is_multistep:
+    if len(normalized) <= 160:
         return False, "short_closed_book"
-    return True, "fallback"
+    return True, "default"
