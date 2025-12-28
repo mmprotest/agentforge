@@ -176,6 +176,17 @@ class Agent:
                 " Output must be exactly one JSON object and nothing else."
             )
         self._append_message({"role": "system", "content": system_prompt})
+        logic_task = self._is_logic_yes_no_task(query)
+        if logic_task:
+            self._append_message(
+                {
+                    "role": "system",
+                    "content": (
+                        "Determine whether the conclusion follows logically. "
+                        "Reason silently. Output exactly one token: Yes or No."
+                    ),
+                }
+            )
         if nonce:
             self._append_message({"role": "system", "content": f"Nonce: {nonce}"})
         self._append_message({"role": "user", "content": query})
@@ -219,10 +230,19 @@ class Agent:
                 ambiguous_tools = True
 
         used_router = False
-        format_retry_remaining = 1 if self.strict_json_mode else 0
+        strict_json_retry_remaining = 1 if self.strict_json_mode else 0
+        format_contract = self._has_strict_format_contract(query)
+        format_contract_retry_remaining = 1 if format_contract else 0
         tool_call_retry_used = False
         yes_no_only = bool(re.search(r"answer yes or no only", query, re.IGNORECASE))
+        logic_instruction = (
+            "Determine whether the conclusion follows logically. "
+            "Reason silently. Output exactly one token: Yes or No."
+        )
         code_check_enabled = self.code_check and is_code_task(query)
+        compute_required = tools_reason == "deterministic_compute"
+        compute_retry_remaining = 1 if compute_required else 0
+        has_successful_compute_call = False
         remaining_steps = self.max_steps
         remaining_tool_calls = max(0, self.max_tool_calls - self._tool_calls)
         remaining_model_calls = max(0, self.max_model_calls - self._model_calls)
@@ -277,6 +297,8 @@ class Agent:
                             continue
                         remaining_tool_calls -= 1
                         self._tool_calls += 1
+                        if compute_required and ok:
+                            has_successful_compute_call = True
                         if ok is False:
                             continue
                         if remaining_model_calls > 0:
@@ -327,7 +349,7 @@ class Agent:
             if self.strict_json_mode and (
                 response.final_text is None or not response.final_text.strip()
             ):
-                if format_retry_remaining > 0:
+                if strict_json_retry_remaining > 0:
                     self._append_message(
                         {
                             "role": "system",
@@ -336,7 +358,7 @@ class Agent:
                             ),
                         }
                     )
-                    format_retry_remaining -= 1
+                    strict_json_retry_remaining -= 1
                     continue
                 return AgentResult(
                     answer="Model returned empty output in strict JSON mode.",
@@ -348,7 +370,7 @@ class Agent:
             if response.final_text:
                 protocol = self._parse_model_protocol(response.final_text)
                 if protocol is None and self.strict_json_mode:
-                    if format_retry_remaining > 0:
+                    if strict_json_retry_remaining > 0:
                         self._append_message(
                             {
                                 "role": "system",
@@ -357,7 +379,7 @@ class Agent:
                                 ),
                             }
                         )
-                        format_retry_remaining -= 1
+                        strict_json_retry_remaining -= 1
                         continue
                     return AgentResult(
                         answer="Could not parse the model output as JSON.",
@@ -376,6 +398,40 @@ class Agent:
                     answer = self._coerce_mcq_answer(answer)
                 if code_check_enabled:
                     answer = self._code_check_loop(answer)
+                if compute_required and not has_successful_compute_call:
+                    if compute_retry_remaining > 0 and remaining_model_calls > 0:
+                        self._append_message(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You must compute this using a tool. Do not guess. "
+                                    "Do not answer directly."
+                                ),
+                            }
+                        )
+                        compute_retry_remaining -= 1
+                        continue
+                    return AgentResult(
+                        answer="Computation was required but not performed using a tool.",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
+                if logic_task and answer.strip() not in {"Yes", "No"}:
+                    if remaining_model_calls <= 0:
+                        return AgentResult(
+                            answer="Answer was not strictly Yes or No.",
+                            tools_used=self.tools_used,
+                            tools_created=self.tools_created,
+                            trace_path=self._finalize_trace(),
+                        )
+                    self._append_message(
+                        {
+                            "role": "system",
+                            "content": logic_instruction,
+                        }
+                    )
+                    continue
                 if yes_no_only and answer.strip() not in {"Yes", "No"}:
                     if remaining_model_calls <= 0:
                         return AgentResult(
@@ -391,6 +447,25 @@ class Agent:
                         }
                     )
                     continue
+                if format_contract and self._format_contract_violation(query, answer):
+                    if format_contract_retry_remaining > 0 and remaining_model_calls > 0:
+                        self._append_message(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You must return only the output in the specified format. "
+                                    "No explanation. No extra text."
+                                ),
+                            }
+                        )
+                        format_contract_retry_remaining -= 1
+                        continue
+                    return AgentResult(
+                        answer="Output violated the requested format contract.",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
                 logger.info("Returning final answer from protocol.")
                 return AgentResult(
                     answer=answer,
@@ -424,6 +499,40 @@ class Agent:
                     answer = self._coerce_mcq_answer(answer)
                 if code_check_enabled:
                     answer = self._code_check_loop(answer)
+                if compute_required and not has_successful_compute_call:
+                    if compute_retry_remaining > 0 and remaining_model_calls > 0:
+                        self._append_message(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You must compute this using a tool. Do not guess. "
+                                    "Do not answer directly."
+                                ),
+                            }
+                        )
+                        compute_retry_remaining -= 1
+                        continue
+                    return AgentResult(
+                        answer="Computation was required but not performed using a tool.",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
+                if logic_task and answer.strip() not in {"Yes", "No"}:
+                    if remaining_model_calls <= 0:
+                        return AgentResult(
+                            answer="Answer was not strictly Yes or No.",
+                            tools_used=self.tools_used,
+                            tools_created=self.tools_created,
+                            trace_path=self._finalize_trace(),
+                        )
+                    self._append_message(
+                        {
+                            "role": "system",
+                            "content": logic_instruction,
+                        }
+                    )
+                    continue
                 if yes_no_only and answer.strip() not in {"Yes", "No"}:
                     if remaining_model_calls <= 0:
                         return AgentResult(
@@ -439,6 +548,25 @@ class Agent:
                         }
                     )
                     continue
+                if format_contract and self._format_contract_violation(query, answer):
+                    if format_contract_retry_remaining > 0 and remaining_model_calls > 0:
+                        self._append_message(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You must return only the output in the specified format. "
+                                    "No explanation. No extra text."
+                                ),
+                            }
+                        )
+                        format_contract_retry_remaining -= 1
+                        continue
+                    return AgentResult(
+                        answer="Output violated the requested format contract.",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
                 logger.info("Returning final answer.")
                 return AgentResult(
                     answer=answer,
@@ -602,6 +730,8 @@ class Agent:
                 continue
             remaining_tool_calls -= 1
             self._tool_calls += 1
+            if compute_required and ok:
+                has_successful_compute_call = True
             if ok is False:
                 continue
         return AgentResult(
@@ -706,6 +836,38 @@ class Agent:
                     "to_unit": match.group(3),
                 }
         return None
+
+    def _has_strict_format_contract(self, query: str) -> bool:
+        patterns = [r"\breturn\b", r"format:", r"answer only", r"answer exactly"]
+        return any(re.search(pattern, query, re.IGNORECASE) for pattern in patterns)
+
+    def _format_contract_violation(self, query: str, answer: str) -> bool:
+        lower = query.lower()
+        expects_csv = "csv" in lower or "comma-separated" in lower or "comma separated" in lower
+        expects_table = "table" in lower or "tabular" in lower
+        expects_pipe = "pipe-separated" in lower or "pipe separated" in lower or "|" in query
+        has_sentence = self._looks_like_sentence(answer)
+        if (expects_csv or expects_table) and has_sentence:
+            return True
+        if expects_csv and "," not in answer:
+            return True
+        if expects_pipe and "|" not in answer:
+            return True
+        if expects_table and ("\n" not in answer and "|" not in answer and "\t" not in answer):
+            return True
+        return False
+
+    def _looks_like_sentence(self, text: str) -> bool:
+        stripped = text.strip()
+        if len(stripped.split()) < 4:
+            return False
+        return bool(re.search(r"[.!?](\s|$)", stripped))
+
+    def _is_logic_yes_no_task(self, query: str) -> bool:
+        return bool(
+            re.search(r"can we conclude", query, re.IGNORECASE)
+            and re.search(r"answer yes or no only", query, re.IGNORECASE)
+        )
 
     def _pick_best(self, candidates: list[AgentResult]) -> AgentResult:
         def score(candidate: AgentResult) -> tuple[float, int, int]:
