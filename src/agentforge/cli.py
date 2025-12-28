@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from typing import Any
 
 from agentforge.config import Settings
@@ -68,6 +69,8 @@ def apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
 
 
 def main() -> None:
+    if sys.platform == "win32":
+        sys.stdout.reconfigure(encoding="utf-8")
     args = parse_args()
     settings = apply_overrides(Settings(), args)
     model = build_model(settings)

@@ -53,6 +53,14 @@ _CODE_TASK_RE = re.compile(
     r"\bpython\s+function\b",
     re.IGNORECASE,
 )
+_COMPUTE_RE = re.compile(
+    r"\b("
+    r"hash|sha-?256|md5|checksum|"
+    r"fibonacci|factorial|"
+    r"compute|calculate"
+    r")\b",
+    re.IGNORECASE,
+)
 _FILE_RE = re.compile(
     r"(?:^|[\s\"'])((?:\.\.?/|~/)[^\s]+)|"
     r"\b[\w\-. ]+\.(?:py|md|txt|json|yaml|yml|toml|csv|ini|log)\b",
@@ -137,6 +145,8 @@ def should_enable_tools(query: str) -> tuple[bool, str]:
         return True, "json"
     if _REGEX_RE.search(normalized):
         return True, "regex"
+    if _COMPUTE_RE.search(normalized):
+        return True, "deterministic_compute"
     if len(normalized) <= 160:
         return False, "short_closed_book"
     return True, "default"
