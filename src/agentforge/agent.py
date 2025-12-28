@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import re
 import sys
@@ -20,6 +20,7 @@ from agentforge.protocol import (
     protocol_from_payload,
 )
 from agentforge.memory import MemoryStore
+from agentforge.problem_state import ProblemState
 from agentforge.routing import is_code_task, should_enable_tools, suggest_tool, tool_candidates
 from agentforge.safety.policy import SafetyPolicy
 from agentforge.trace import TraceRecorder
@@ -32,6 +33,7 @@ from agentforge.util.logging import get_logger, redact
 
 
 logger = get_logger(__name__)
+MAX_REFLECTION_ROUNDS = 3
 
 
 @dataclass
@@ -42,6 +44,13 @@ class AgentResult:
     trace_path: str | None = None
     checks: list[str] = field(default_factory=list)
     confidence: float | None = None
+
+
+@dataclass
+class StepOutcome:
+    step_summary: str
+    candidate_solution: str | None = None
+    failure_reason: str | None = None
 
 
 class Agent:
@@ -176,21 +185,13 @@ class Agent:
                 " Output must be exactly one JSON object and nothing else."
             )
         self._append_message({"role": "system", "content": system_prompt})
-        logic_task = self._is_logic_yes_no_task(query)
-        if logic_task:
-            self._append_message(
-                {
-                    "role": "system",
-                    "content": (
-                        "Determine whether the conclusion follows logically. "
-                        "Reason silently. Output exactly one token: Yes or No."
-                    ),
-                }
-            )
         if nonce:
             self._append_message({"role": "system", "content": f"Nonce: {nonce}"})
         self._append_message({"role": "user", "content": query})
-        self._internal_plan(query)
+
+        problem_state = self._build_problem_state(query)
+        logger.info("Problem state initialized: %s", redact(self._state_to_json(problem_state)))
+
         if self.trace:
             self.trace.record_messages(self._messages)
 
@@ -220,95 +221,62 @@ class Agent:
         elif tools_reason == "deterministic_compute":
             logger.info("Controller enabled tools (deterministic_compute).")
 
-        candidates = tool_candidates(query) if tools_enabled else []
-        ambiguous_tools = False
-        if len(candidates) > 1:
-            sorted_candidates = sorted(
-                candidates, key=lambda candidate: candidate.confidence, reverse=True
-            )
-            if sorted_candidates[0].confidence - sorted_candidates[1].confidence <= 0.15:
-                ambiguous_tools = True
-
-        used_router = False
-        strict_json_retry_remaining = 1 if self.strict_json_mode else 0
-        format_contract = self._has_strict_format_contract(query)
-        format_contract_retry_remaining = 1 if format_contract else 0
-        tool_call_retry_used = False
-        yes_no_only = bool(re.search(r"answer yes or no only", query, re.IGNORECASE))
-        logic_instruction = (
-            "Determine whether the conclusion follows logically. "
-            "Reason silently. Output exactly one token: Yes or No."
-        )
-        code_check_enabled = self.code_check and is_code_task(query)
-        compute_required = tools_reason == "deterministic_compute"
-        compute_retry_remaining = 1 if compute_required else 0
-        has_successful_compute_call = False
-        remaining_steps = self.max_steps
         remaining_tool_calls = max(0, self.max_tool_calls - self._tool_calls)
         remaining_model_calls = max(0, self.max_model_calls - self._model_calls)
         logger.info(
-            "Limits: steps=%s, model_calls=%s, tool_calls=%s",
-            remaining_steps,
+            "Limits: model_calls=%s, tool_calls=%s",
             remaining_model_calls,
             remaining_tool_calls,
         )
-        while remaining_steps > 0:
-            remaining_steps -= 1
-            step_index = self.max_steps - remaining_steps
-            logger.info(
-                "Step %s/%s (remaining model_calls=%s, tool_calls=%s).",
-                step_index,
-                self.max_steps,
-                remaining_model_calls,
-                remaining_tool_calls,
-            )
-            suggestion = (
-                suggest_tool(query) if not used_router and tools_enabled else None
-            )
-            if (
-                suggestion
-                and suggestion.confidence >= 0.8
-                and remaining_tool_calls > 0
-                and tools_enabled
-            ):
-                direct_args = self._direct_tool_args(suggestion.tool_name, query)
-                if direct_args is not None:
-                    tool = self.registry.get(suggestion.tool_name)
-                    if tool and self.policy.is_tool_allowed(suggestion.tool_name):
-                        logger.info(
-                            "Router direct tool call: %s args=%s",
-                            suggestion.tool_name,
-                            redact(json.dumps(direct_args, ensure_ascii=False)),
-                        )
-                        output, ok, schema_error = self._execute_tool(tool, direct_args)
-                        self._handle_tool_result(
-                            suggestion.tool_name,
-                            output,
-                            None,
-                            direct_args,
-                            message_role="system",
-                            explanation=(
-                                "Router auto-executed a tool based on the request."
-                            ),
-                        )
-                        used_router = True
-                        if schema_error:
-                            self._append_schema_retry(tool, output)
-                            continue
-                        remaining_tool_calls -= 1
-                        self._tool_calls += 1
-                        if compute_required and ok:
-                            has_successful_compute_call = True
-                        if ok is False:
-                            continue
-                        if remaining_model_calls > 0:
-                            continue
-                        return AgentResult(
-                            answer="Reached model call limit",
-                            tools_used=self.tools_used,
-                            tools_created=self.tools_created,
-                            trace_path=self._finalize_trace(),
-                        )
+        return self._run_reflective_loop(
+            query,
+            problem_state,
+            tools_enabled=tools_enabled,
+            remaining_model_calls=remaining_model_calls,
+            remaining_tool_calls=remaining_tool_calls,
+        )
+
+    def _build_problem_state(self, query: str) -> ProblemState:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are analyzing a problem. Identify constraints, known facts, "
+                    "unknowns, and a high-level plan. Do not solve yet. "
+                    "Return JSON with keys: constraints, known_facts, unknowns, plan."
+                ),
+            },
+            {"role": "user", "content": query},
+        ]
+        if self._model_calls >= self.max_model_calls:
+            return ProblemState(objective=query)
+        response = self.model.chat(messages, tools=None)
+        self._model_calls += 1
+        payload = self._parse_json_payload(response.final_text or "")
+        if not isinstance(payload, dict):
+            return ProblemState(objective=query)
+        return ProblemState(
+            objective=query,
+            constraints=[str(item) for item in payload.get("constraints") or []],
+            known_facts=[str(item) for item in payload.get("known_facts") or []],
+            unknowns=[str(item) for item in payload.get("unknowns") or []],
+            plan=[str(item) for item in payload.get("plan") or []],
+        )
+
+    def _run_reflective_loop(
+        self,
+        query: str,
+        problem_state: ProblemState,
+        *,
+        tools_enabled: bool,
+        remaining_model_calls: int,
+        remaining_tool_calls: int,
+    ) -> AgentResult:
+        candidates: list[tuple[str, ProblemState]] = []
+        code_check_enabled = self.code_check and is_code_task(query)
+        used_router = False
+        if tools_enabled:
+            suggestion = suggest_tool(query)
             if suggestion and not used_router:
                 logger.info(
                     "Router suggested tool: %s (%s)",
@@ -322,7 +290,7 @@ class Agent:
                     }
                 )
                 used_router = True
-            tools = self.registry.openai_schemas() if tools_enabled else None
+        for round_index in range(MAX_REFLECTION_ROUNDS):
             if remaining_model_calls <= 0:
                 return AgentResult(
                     answer="Reached model call limit",
@@ -330,416 +298,401 @@ class Agent:
                     tools_created=self.tools_created,
                     trace_path=self._finalize_trace(),
                 )
-            logger.info("Calling model (call #%s).", self._model_calls + 1)
-            response = self.model.chat(self._messages, tools=tools)
-            self._model_calls += 1
-            remaining_model_calls -= 1
-            logger.info(
-                "Model response: final_text=%s tool_call=%s",
-                bool(response.final_text),
-                response.tool_call.name if response.tool_call else "none",
+            step_desc = problem_state.plan[0] if problem_state.plan else "Advance the objective."
+            outcome = self._execute_plan_step(
+                problem_state,
+                step_desc,
+                tools_enabled=tools_enabled,
+                remaining_tool_calls=remaining_tool_calls,
             )
-            if self.trace:
-                tool_payload = (
-                    response.tool_call.model_dump()
-                    if response.tool_call is not None
-                    else None
+            remaining_tool_calls = max(0, self.max_tool_calls - self._tool_calls)
+            remaining_model_calls = max(0, self.max_model_calls - self._model_calls)
+            if outcome.step_summary:
+                problem_state.known_facts.append(outcome.step_summary)
+            if outcome.candidate_solution:
+                problem_state.candidate_solution = outcome.candidate_solution
+                candidates.append((outcome.candidate_solution, problem_state))
+            if outcome.failure_reason:
+                problem_state.failure_reason = outcome.failure_reason
+
+            reflection = self._reflect_on_step(problem_state, outcome.step_summary)
+            if reflection is not None:
+                advanced = reflection.get("advanced", True)
+                reason = reflection.get("reason")
+                revised_plan = reflection.get("plan")
+                logger.info(
+                    "Reflection outcome: advanced=%s reason=%s",
+                    advanced,
+                    redact(str(reason) if reason is not None else ""),
                 )
-                self.trace.record_model_response(response.final_text, tool_payload)
-            if self.strict_json_mode and (
-                response.final_text is None or not response.final_text.strip()
-            ):
-                if strict_json_retry_remaining > 0:
-                    self._append_message(
-                        {
-                            "role": "system",
-                            "content": (
-                                "You must output valid JSON only. No explanation. No tools."
-                            ),
-                        }
+                if reflection.get("known_facts"):
+                    problem_state.known_facts.extend(
+                        [str(item) for item in reflection.get("known_facts") or []]
                     )
-                    strict_json_retry_remaining -= 1
-                    continue
-                return AgentResult(
-                    answer="Model returned empty output in strict JSON mode.",
-                    tools_used=self.tools_used,
-                    tools_created=self.tools_created,
-                    trace_path=self._finalize_trace(),
-                )
-            protocol = None
-            if response.final_text:
-                protocol = self._parse_model_protocol(response.final_text)
-                if protocol is None and self.strict_json_mode:
-                    if strict_json_retry_remaining > 0:
-                        self._append_message(
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You must output valid JSON only. No explanation. No tools."
-                                ),
-                            }
-                        )
-                        strict_json_retry_remaining -= 1
-                        continue
-                    return AgentResult(
-                        answer="Could not parse the model output as JSON.",
-                        tools_used=self.tools_used,
-                        tools_created=self.tools_created,
-                        trace_path=self._finalize_trace(),
-                    )
-            if response.tool_call is None and response.final_text:
-                tool_call = self._parse_tool_call_from_text(response.final_text)
-                if tool_call is not None:
-                    response = response.model_copy(update={"tool_call": tool_call})
-            protocol_tool_call = isinstance(protocol, ProtocolToolCall)
-            if response.final_text is not None and isinstance(protocol, ProtocolFinal):
-                answer = format_final(protocol.answer, protocol.checks)
-                if self._mcq_letters:
-                    answer = self._coerce_mcq_answer(answer)
-                if code_check_enabled:
-                    answer = self._code_check_loop(answer)
-                if compute_required and not has_successful_compute_call:
-                    if compute_retry_remaining > 0 and remaining_model_calls > 0:
-                        self._append_message(
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You must compute this using a tool. Do not guess. "
-                                    "Do not answer directly."
-                                ),
-                            }
-                        )
-                        compute_retry_remaining -= 1
-                        continue
-                    return AgentResult(
-                        answer="Computation was required but not performed using a tool.",
-                        tools_used=self.tools_used,
-                        tools_created=self.tools_created,
-                        trace_path=self._finalize_trace(),
-                    )
-                if logic_task and answer.strip() not in {"Yes", "No"}:
-                    if remaining_model_calls <= 0:
-                        return AgentResult(
-                            answer="Answer was not strictly Yes or No.",
-                            tools_used=self.tools_used,
-                            tools_created=self.tools_created,
-                            trace_path=self._finalize_trace(),
-                        )
-                    self._append_message(
-                        {
-                            "role": "system",
-                            "content": logic_instruction,
-                        }
-                    )
-                    continue
-                if yes_no_only and answer.strip() not in {"Yes", "No"}:
-                    if remaining_model_calls <= 0:
-                        return AgentResult(
-                            answer="Answer was not strictly Yes or No.",
-                            tools_used=self.tools_used,
-                            tools_created=self.tools_created,
-                            trace_path=self._finalize_trace(),
-                        )
-                    self._append_message(
-                        {
-                            "role": "system",
-                            "content": "Answer with exactly one token: Yes or No.",
-                        }
-                    )
-                    continue
-                if format_contract and self._format_contract_violation(query, answer):
-                    if format_contract_retry_remaining > 0 and remaining_model_calls > 0:
-                        self._append_message(
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You must return only the output in the specified format. "
-                                    "No explanation. No extra text."
-                                ),
-                            }
-                        )
-                        format_contract_retry_remaining -= 1
-                        continue
-                    return AgentResult(
-                        answer="Output violated the requested format contract.",
-                        tools_used=self.tools_used,
-                        tools_created=self.tools_created,
-                        trace_path=self._finalize_trace(),
-                    )
-                logger.info("Returning final answer from protocol.")
-                return AgentResult(
-                    answer=answer,
-                    tools_used=self.tools_used,
-                    tools_created=self.tools_created,
-                    checks=protocol.checks,
-                    confidence=protocol.confidence,
-                    trace_path=self._finalize_trace(),
-                )
-            if response.final_text is not None and response.tool_call is None:
-                if protocol_tool_call:
-                    if remaining_model_calls <= 0:
-                        return AgentResult(
-                            answer="No valid tool call from model",
-                            tools_used=self.tools_used,
-                            tools_created=self.tools_created,
-                            trace_path=self._finalize_trace(),
-                        )
-                    self._append_message(
-                        {
-                            "role": "system",
-                            "content": (
-                                "The tool call format was invalid. "
-                                "Respond with a valid tool call or a final answer."
-                            ),
-                        }
-                    )
-                    continue
-                answer = response.final_text
-                if self._mcq_letters:
-                    answer = self._coerce_mcq_answer(answer)
-                if code_check_enabled:
-                    answer = self._code_check_loop(answer)
-                if compute_required and not has_successful_compute_call:
-                    if compute_retry_remaining > 0 and remaining_model_calls > 0:
-                        self._append_message(
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You must compute this using a tool. Do not guess. "
-                                    "Do not answer directly."
-                                ),
-                            }
-                        )
-                        compute_retry_remaining -= 1
-                        continue
-                    return AgentResult(
-                        answer="Computation was required but not performed using a tool.",
-                        tools_used=self.tools_used,
-                        tools_created=self.tools_created,
-                        trace_path=self._finalize_trace(),
-                    )
-                if logic_task and answer.strip() not in {"Yes", "No"}:
-                    if remaining_model_calls <= 0:
-                        return AgentResult(
-                            answer="Answer was not strictly Yes or No.",
-                            tools_used=self.tools_used,
-                            tools_created=self.tools_created,
-                            trace_path=self._finalize_trace(),
-                        )
-                    self._append_message(
-                        {
-                            "role": "system",
-                            "content": logic_instruction,
-                        }
-                    )
-                    continue
-                if yes_no_only and answer.strip() not in {"Yes", "No"}:
-                    if remaining_model_calls <= 0:
-                        return AgentResult(
-                            answer="Answer was not strictly Yes or No.",
-                            tools_used=self.tools_used,
-                            tools_created=self.tools_created,
-                            trace_path=self._finalize_trace(),
-                        )
-                    self._append_message(
-                        {
-                            "role": "system",
-                            "content": "Answer with exactly one token: Yes or No.",
-                        }
-                    )
-                    continue
-                if format_contract and self._format_contract_violation(query, answer):
-                    if format_contract_retry_remaining > 0 and remaining_model_calls > 0:
-                        self._append_message(
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You must return only the output in the specified format. "
-                                    "No explanation. No extra text."
-                                ),
-                            }
-                        )
-                        format_contract_retry_remaining -= 1
-                        continue
-                    return AgentResult(
-                        answer="Output violated the requested format contract.",
-                        tools_used=self.tools_used,
-                        tools_created=self.tools_created,
-                        trace_path=self._finalize_trace(),
-                    )
-                logger.info("Returning final answer.")
-                return AgentResult(
-                    answer=answer,
-                    tools_used=self.tools_used,
-                    tools_created=self.tools_created,
-                    trace_path=self._finalize_trace(),
-                )
-            if response.tool_call is None:
-                if tools_enabled and ambiguous_tools:
-                    elected, remaining_model_calls = self._maybe_vote_tool_call(
-                        tools,
-                        response,
-                        remaining_model_calls,
-                        ambiguous=True,
-                    )
-                    if elected is not None:
-                        response = response.model_copy(update={"tool_call": elected})
-                    else:
-                        return AgentResult(
-                            answer="No response from model",
-                            tools_used=self.tools_used,
-                            tools_created=self.tools_created,
-                            trace_path=self._finalize_trace(),
-                        )
-                else:
-                    return AgentResult(
-                        answer="No response from model",
-                        tools_used=self.tools_used,
-                        tools_created=self.tools_created,
-                        trace_path=self._finalize_trace(),
-                    )
-            if not tools_enabled:
-                if tool_call_retry_used:
-                    return AgentResult(
-                        answer="Tools are disabled and the model attempted a tool call again.",
-                        tools_used=self.tools_used,
-                        tools_created=self.tools_created,
-                        trace_path=self._finalize_trace(),
-                    )
-                if remaining_model_calls <= 0:
-                    return AgentResult(
-                        answer="Tools are disabled and the model attempted a tool call.",
-                        tools_used=self.tools_used,
-                        tools_created=self.tools_created,
-                        trace_path=self._finalize_trace(),
-                    )
-                self._append_message(
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are not allowed to use tools. If the task requires "
-                            "external data or computation, explicitly say so. "
-                            "Otherwise, answer directly without guessing."
-                        ),
-                    }
-                )
-                tool_call_retry_used = True
-                continue
-            tool_name = response.tool_call.name
-            if remaining_tool_calls <= 0:
-                return AgentResult(
-                    answer="Reached tool call limit",
-                    tools_used=self.tools_used,
-                    tools_created=self.tools_created,
-                    trace_path=self._finalize_trace(),
-                )
-            tool = self.registry.get(tool_name)
-            if tool is None or not self.policy.is_tool_allowed(tool_name):
-                elected, remaining_model_calls = self._maybe_vote_tool_call(
-                    tools,
-                    response,
-                    remaining_model_calls,
-                    schema_error=True,
-                    ambiguous=ambiguous_tools,
-                )
-                if elected is not None:
-                    response = response.model_copy(update={"tool_call": elected})
-                    tool_name = response.tool_call.name
-                    tool = self.registry.get(tool_name)
-                if tool is None:
-                    return AgentResult(
-                        answer=f"Requested unknown tool: {tool_name}",
-                        tools_used=self.tools_used,
-                        tools_created=self.tools_created,
-                        trace_path=self._finalize_trace(),
-                    )
-                if not self.policy.is_tool_allowed(tool_name):
-                    return AgentResult(
-                        answer=f"Tool not allowed: {tool_name}",
-                        tools_used=self.tools_used,
-                        tools_created=self.tools_created,
-                        trace_path=self._finalize_trace(),
-                    )
-            try:
-                validated_args = tool.input_schema.model_validate(
-                    response.tool_call.arguments
-                ).model_dump()
-            except ValidationError as exc:
-                elected, remaining_model_calls = self._maybe_vote_tool_call(
-                    tools,
-                    response,
-                    remaining_model_calls,
-                    schema_error=True,
-                    ambiguous=ambiguous_tools,
-                )
-                if elected is not None:
-                    response = response.model_copy(update={"tool_call": elected})
-                    tool_name = response.tool_call.name
-                    tool = self.registry.get(tool_name)
-                    if tool is None:
-                        return AgentResult(
-                            answer=f"Requested unknown tool: {tool_name}",
-                            tools_used=self.tools_used,
-                            tools_created=self.tools_created,
-                            trace_path=self._finalize_trace(),
-                        )
-                    if not self.policy.is_tool_allowed(tool_name):
-                        return AgentResult(
-                            answer=f"Tool not allowed: {tool_name}",
-                            tools_used=self.tools_used,
-                            tools_created=self.tools_created,
-                            trace_path=self._finalize_trace(),
-                        )
-                    try:
-                        validated_args = tool.input_schema.model_validate(
-                            response.tool_call.arguments
-                        ).model_dump()
-                    except ValidationError as exc2:
-                        output = self._tool_error_payload(tool, exc2, schema_error=True)
-                        self._handle_tool_result(
-                            tool_name,
-                            output,
-                            response.tool_call.id,
-                            response.tool_call.arguments,
-                        )
-                        self._append_schema_retry(tool, output)
-                        continue
-                else:
-                    output = self._tool_error_payload(tool, exc, schema_error=True)
-                    self._handle_tool_result(
-                        tool_name,
-                        output,
-                        response.tool_call.id,
-                        response.tool_call.arguments,
-                    )
-                    self._append_schema_retry(tool, output)
-                    continue
-            logger.info(
-                "Tool call requested: %s args=%s",
-                tool_name,
-                redact(json.dumps(validated_args, ensure_ascii=False)),
+                if reflection.get("unknowns") is not None:
+                    problem_state.unknowns = [
+                        str(item) for item in reflection.get("unknowns") or []
+                    ]
+                if not advanced:
+                    problem_state.failure_reason = reason or problem_state.failure_reason
+                    if isinstance(revised_plan, list) and revised_plan:
+                        problem_state.plan = [str(item) for item in revised_plan]
+                        logger.info("Plan revised: %s", redact(json.dumps(problem_state.plan)))
+                    logger.info("Reflection indicated lack of progress: %s", redact(reason or ""))
+            if problem_state.candidate_solution and not problem_state.unknowns:
+                break
+            if round_index == 0 and not problem_state.candidate_solution and problem_state.unknowns:
+                alternative_paths = self._generate_alternative_paths(problem_state, count=2)
+                for idx, alt_state in enumerate(alternative_paths):
+                    logger.info("Exploring alternative path %s: %s", idx + 1, redact(json.dumps(alt_state.plan)))
+                    alt_outcome = self._execute_alternative_step(query, alt_state)
+                    if alt_outcome.step_summary:
+                        alt_state.known_facts.append(alt_outcome.step_summary)
+                    if alt_outcome.candidate_solution:
+                        alt_state.candidate_solution = alt_outcome.candidate_solution
+                        candidates.append((alt_outcome.candidate_solution, alt_state))
+
+        if not candidates and problem_state.candidate_solution:
+            candidates.append((problem_state.candidate_solution, problem_state))
+
+        if not candidates:
+            return AgentResult(
+                answer="Unable to derive a solution with available information.",
+                tools_used=self.tools_used,
+                tools_created=self.tools_created,
+                trace_path=self._finalize_trace(),
             )
-            output, ok, schema_error = self._execute_tool(
-                tool, validated_args
+
+        verified = self._verify_candidates(problem_state, candidates)
+        if verified is None:
+            best_solution, best_state = candidates[0]
+        else:
+            best_solution, best_state = verified
+
+        confidence, confidence_reason = self._estimate_confidence(best_state, best_solution)
+        best_state.confidence = confidence
+        if confidence < 0.6:
+            refusal = "I am not confident enough to provide a definitive answer."
+            if confidence_reason:
+                refusal = f"{refusal} {confidence_reason}"
+            return AgentResult(
+                answer=refusal,
+                tools_used=self.tools_used,
+                tools_created=self.tools_created,
+                confidence=confidence,
+                trace_path=self._finalize_trace(),
             )
-            self._handle_tool_result(
-                tool_name, output, response.tool_call.id, validated_args
-            )
-            if schema_error:
-                self._append_schema_retry(tool, output)
-                continue
-            remaining_tool_calls -= 1
-            self._tool_calls += 1
-            if compute_required and ok:
-                has_successful_compute_call = True
-            if ok is False:
-                continue
+
+        final_answer = best_solution
+        if code_check_enabled:
+            final_answer = self._code_check_loop(final_answer)
+        if self._mcq_letters:
+            final_answer = self._coerce_mcq_answer(final_answer)
         return AgentResult(
-            answer="Reached step limit",
+            answer=final_answer,
             tools_used=self.tools_used,
             tools_created=self.tools_created,
+            confidence=confidence,
             trace_path=self._finalize_trace(),
         )
+
+    def _execute_plan_step(
+        self,
+        problem_state: ProblemState,
+        step_desc: str,
+        *,
+        tools_enabled: bool,
+        remaining_tool_calls: int,
+    ) -> StepOutcome:
+        self._append_message(
+            {
+                "role": "system",
+                "content": (
+                    "Execute the next plan step. Use tools if necessary. "
+                    f"Plan step: {step_desc}"
+                ),
+            }
+        )
+        tools = self.registry.openai_schemas() if tools_enabled else None
+        if self._model_calls >= self.max_model_calls:
+            return StepOutcome(step_summary="Model call limit reached.", failure_reason="limit")
+        response = self.model.chat(self._messages, tools=tools)
+        self._model_calls += 1
+        if self.trace:
+            tool_payload = (
+                response.tool_call.model_dump()
+                if response.tool_call is not None
+                else None
+            )
+            self.trace.record_model_response(response.final_text, tool_payload)
+        protocol = None
+        if response.final_text:
+            protocol = self._parse_model_protocol(response.final_text)
+        if response.tool_call is None and response.final_text:
+            tool_call = self._parse_tool_call_from_text(response.final_text)
+            if tool_call is not None:
+                response = response.model_copy(update={"tool_call": tool_call})
+        if response.tool_call is None:
+            if isinstance(protocol, ProtocolFinal):
+                answer = format_final(protocol.answer, protocol.checks)
+            else:
+                answer = response.final_text or ""
+            candidate = answer.strip()
+            if not candidate:
+                return StepOutcome(
+                    step_summary="Model returned no answer for the plan step.",
+                    failure_reason="no_answer",
+                )
+            return StepOutcome(
+                step_summary="Derived candidate solution from reasoning.",
+                candidate_solution=candidate,
+            )
+        if not tools_enabled:
+            return StepOutcome(
+                step_summary="Tool call requested while tools are disabled.",
+                failure_reason="tools_disabled",
+            )
+        if remaining_tool_calls <= 0:
+            return StepOutcome(
+                step_summary="Tool call limit reached.",
+                failure_reason="tool_limit",
+            )
+        tool_name = response.tool_call.name
+        tool = self.registry.get(tool_name)
+        if tool is None or not self.policy.is_tool_allowed(tool_name):
+            return StepOutcome(
+                step_summary=f"Requested unknown or disallowed tool: {tool_name}",
+                failure_reason="tool_unavailable",
+            )
+        try:
+            validated_args = tool.input_schema.model_validate(
+                response.tool_call.arguments
+            ).model_dump()
+        except ValidationError as exc:
+            output = self._tool_error_payload(tool, exc, schema_error=True)
+            self._handle_tool_result(
+                tool_name,
+                output,
+                response.tool_call.id,
+                response.tool_call.arguments,
+            )
+            return StepOutcome(
+                step_summary=f"Tool schema error for {tool_name}.",
+                failure_reason="tool_schema_error",
+            )
+        logger.info(
+            "Tool call requested: %s args=%s",
+            tool_name,
+            redact(json.dumps(validated_args, ensure_ascii=False)),
+        )
+        output, ok, _schema_error = self._execute_tool(tool, validated_args)
+        self._handle_tool_result(tool_name, output, response.tool_call.id, validated_args)
+        self._tool_calls += 1
+        summary = f"Tool {tool_name} returned: {self.memory.entries[-1].summary}"
+        if ok is False:
+            return StepOutcome(step_summary=summary, failure_reason="tool_failed")
+        return StepOutcome(step_summary=summary)
+
+    def _reflect_on_step(
+        self,
+        problem_state: ProblemState,
+        step_summary: str,
+    ) -> dict[str, Any] | None:
+        if self._model_calls >= self.max_model_calls:
+            return None
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Given the current problem state, did the last step reduce "
+                    "uncertainty or advance the solution? If not, explain why and "
+                    "revise the plan. Return JSON with keys: advanced, reason, plan, "
+                    "known_facts, unknowns."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Problem state: {self._state_to_json(problem_state)}\n"
+                    f"Last step: {step_summary}"
+                ),
+            },
+        ]
+        response = self.model.chat(messages, tools=None)
+        self._model_calls += 1
+        payload = self._parse_json_payload(response.final_text or "")
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def _generate_alternative_paths(
+        self, problem_state: ProblemState, *, count: int
+    ) -> list[ProblemState]:
+        if self._model_calls >= self.max_model_calls:
+            return []
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Generate alternative solution paths with different approaches. "
+                    "Return JSON with a 'paths' list, each containing a 'plan' list."
+                ),
+            },
+            {
+                "role": "user",
+                "content": self._state_to_json(problem_state),
+            },
+        ]
+        response = self.model.chat(messages, tools=None)
+        self._model_calls += 1
+        payload = self._parse_json_payload(response.final_text or "")
+        paths = []
+        for item in (payload or {}).get("paths", [])[:count]:
+            plan = [str(step) for step in item.get("plan") or []]
+            paths.append(replace(problem_state, plan=plan, candidate_solution=None))
+        return paths
+
+    def _execute_alternative_step(self, query: str, problem_state: ProblemState) -> StepOutcome:
+        if self._model_calls >= self.max_model_calls:
+            return StepOutcome(step_summary="Model call limit reached.", failure_reason="limit")
+        step_desc = problem_state.plan[0] if problem_state.plan else "Advance the objective."
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Execute one plan step using a distinct reasoning approach. "
+                    "Return either a final answer or a concise summary."
+                ),
+            },
+            {"role": "user", "content": f"Objective: {query}\nPlan step: {step_desc}"},
+        ]
+        response = self.model.chat(messages, tools=None)
+        self._model_calls += 1
+        text = response.final_text or ""
+        candidate = text.strip()
+        if not candidate:
+            return StepOutcome(
+                step_summary="Alternative path produced no response.",
+                failure_reason="no_response",
+            )
+        return StepOutcome(
+            step_summary="Alternative path produced a candidate solution.",
+            candidate_solution=candidate,
+        )
+
+    def _verify_candidates(
+        self,
+        problem_state: ProblemState,
+        candidates: list[tuple[str, ProblemState]],
+    ) -> tuple[str, ProblemState] | None:
+        if self._model_calls >= self.max_model_calls:
+            return None
+        payload = {
+            "objective": problem_state.objective,
+            "constraints": problem_state.constraints,
+            "known_facts": problem_state.known_facts,
+            "candidates": [
+                {"index": idx, "solution": solution}
+                for idx, (solution, _state) in enumerate(candidates)
+            ],
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Verify each candidate solution against the original objective and "
+                    "constraints. Identify inconsistencies, missing assumptions, or "
+                    "contradictions. Return JSON with a 'results' list containing "
+                    "index, valid, issues, unknowns."
+                ),
+            },
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        response = self.model.chat(messages, tools=None)
+        self._model_calls += 1
+        verification = self._parse_json_payload(response.final_text or "")
+        results = (verification or {}).get("results") or []
+        best_idx = None
+        best_score = None
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            idx = result.get("index")
+            if not isinstance(idx, int) or idx < 0 or idx >= len(candidates):
+                continue
+            valid = result.get("valid", True)
+            if not valid:
+                continue
+            unknowns = result.get("unknowns") or []
+            score = len(unknowns)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_idx = idx
+        if best_idx is None:
+            return None
+        return candidates[best_idx]
+
+    def _estimate_confidence(
+        self, problem_state: ProblemState, solution: str
+    ) -> tuple[float, str | None]:
+        if self._model_calls >= self.max_model_calls:
+            return 0.0, "Confidence could not be estimated."
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Estimate confidence (0–1) in the selected solution. "
+                    "If confidence < 0.6, explain why. Return JSON with keys: "
+                    "confidence, reason."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Objective: {problem_state.objective}\n"
+                    f"Constraints: {problem_state.constraints}\n"
+                    f"Known facts: {problem_state.known_facts}\n"
+                    f"Solution: {solution}"
+                ),
+            },
+        ]
+        response = self.model.chat(messages, tools=None)
+        self._model_calls += 1
+        payload = self._parse_json_payload(response.final_text or "")
+        if not isinstance(payload, dict):
+            return 0.0, None
+        confidence = payload.get("confidence", 0.0)
+        reason = payload.get("reason")
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            confidence_value = 0.0
+        return confidence_value, str(reason) if reason else None
+
+    def _parse_json_payload(self, content: str) -> dict[str, Any] | None:
+        if not content:
+            return None
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            try:
+                payload = repair_json(content)
+            except JsonRepairError:
+                return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def _state_to_json(self, problem_state: ProblemState) -> str:
+        payload = {
+            "objective": problem_state.objective,
+            "constraints": problem_state.constraints,
+            "known_facts": problem_state.known_facts,
+            "unknowns": problem_state.unknowns,
+            "plan": problem_state.plan,
+            "failure_reason": problem_state.failure_reason,
+        }
+        return json.dumps(payload, ensure_ascii=False)
 
     def _handle_tool_result(
         self,
