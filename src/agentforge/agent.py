@@ -206,6 +206,8 @@ class Agent:
             )
         elif tools_reason == "dynamic_info":
             logger.info("Controller enabled tools (dynamic_info).")
+        elif tools_reason == "deterministic_compute":
+            logger.info("Controller enabled tools (deterministic_compute).")
 
         candidates = tool_candidates(query) if tools_enabled else []
         ambiguous_tools = False
@@ -219,6 +221,7 @@ class Agent:
         used_router = False
         format_retry_remaining = 1 if self.strict_json_mode else 0
         tool_call_retry_used = False
+        yes_no_only = bool(re.search(r"answer yes or no only", query, re.IGNORECASE))
         code_check_enabled = self.code_check and is_code_task(query)
         remaining_steps = self.max_steps
         remaining_tool_calls = max(0, self.max_tool_calls - self._tool_calls)
@@ -321,6 +324,26 @@ class Agent:
                     else None
                 )
                 self.trace.record_model_response(response.final_text, tool_payload)
+            if self.strict_json_mode and (
+                response.final_text is None or not response.final_text.strip()
+            ):
+                if format_retry_remaining > 0:
+                    self._append_message(
+                        {
+                            "role": "system",
+                            "content": (
+                                "You must output valid JSON only. No explanation. No tools."
+                            ),
+                        }
+                    )
+                    format_retry_remaining -= 1
+                    continue
+                return AgentResult(
+                    answer="Model returned empty output in strict JSON mode.",
+                    tools_used=self.tools_used,
+                    tools_created=self.tools_created,
+                    trace_path=self._finalize_trace(),
+                )
             protocol = None
             if response.final_text:
                 protocol = self._parse_model_protocol(response.final_text)
@@ -330,8 +353,7 @@ class Agent:
                             {
                                 "role": "system",
                                 "content": (
-                                    "Format error: respond with exactly one JSON object "
-                                    "and nothing else."
+                                    "You must output valid JSON only. No explanation. No tools."
                                 ),
                             }
                         )
@@ -354,6 +376,21 @@ class Agent:
                     answer = self._coerce_mcq_answer(answer)
                 if code_check_enabled:
                     answer = self._code_check_loop(answer)
+                if yes_no_only and answer.strip() not in {"Yes", "No"}:
+                    if remaining_model_calls <= 0:
+                        return AgentResult(
+                            answer="Answer was not strictly Yes or No.",
+                            tools_used=self.tools_used,
+                            tools_created=self.tools_created,
+                            trace_path=self._finalize_trace(),
+                        )
+                    self._append_message(
+                        {
+                            "role": "system",
+                            "content": "Answer with exactly one token: Yes or No.",
+                        }
+                    )
+                    continue
                 logger.info("Returning final answer from protocol.")
                 return AgentResult(
                     answer=answer,
@@ -387,6 +424,21 @@ class Agent:
                     answer = self._coerce_mcq_answer(answer)
                 if code_check_enabled:
                     answer = self._code_check_loop(answer)
+                if yes_no_only and answer.strip() not in {"Yes", "No"}:
+                    if remaining_model_calls <= 0:
+                        return AgentResult(
+                            answer="Answer was not strictly Yes or No.",
+                            tools_used=self.tools_used,
+                            tools_created=self.tools_created,
+                            trace_path=self._finalize_trace(),
+                        )
+                    self._append_message(
+                        {
+                            "role": "system",
+                            "content": "Answer with exactly one token: Yes or No.",
+                        }
+                    )
+                    continue
                 logger.info("Returning final answer.")
                 return AgentResult(
                     answer=answer,
@@ -437,9 +489,9 @@ class Agent:
                     {
                         "role": "system",
                         "content": (
-                            "You are not allowed to use tools. If this question requires "
-                            "external or real-time information, state that explicitly "
-                            "instead of guessing."
+                            "You are not allowed to use tools. If the task requires "
+                            "external data or computation, explicitly say so. "
+                            "Otherwise, answer directly without guessing."
                         ),
                     }
                 )
