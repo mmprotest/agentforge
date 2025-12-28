@@ -74,5 +74,4 @@ def protocol_from_payload(payload: dict[str, Any]) -> ProtocolToolCall | Protoco
 
 def format_final(answer: str, checks: list[str]) -> str:
     """Format final user-facing response."""
-    summary = "; ".join(checks) if checks else "Answered the request."
-    return f"{answer}\n\nWhat I did: {summary}"
+    return answer

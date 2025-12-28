@@ -89,6 +89,7 @@ class Agent:
         self._model_calls = 0
         self._tool_calls = 0
         self._pending_tool_call_response = None
+        self._mcq_letters: set[str] = set()
 
     def _internal_plan(self, query: str) -> None:
         if self.mode != "deep":
@@ -115,6 +116,7 @@ class Agent:
         self._model_calls = 0
         self._tool_calls = 0
         self._pending_tool_call_response = None
+        self._mcq_letters = self._detect_mcq(query)
         if self.self_consistency > 1:
             candidates: list[AgentResult] = []
             for index in range(self.self_consistency):
@@ -125,12 +127,17 @@ class Agent:
                 candidates.append(result)
             if not candidates:
                 return AgentResult(answer="No response from model")
-            best = self._pick_best(candidates)
+            if self._mcq_letters:
+                best = self._pick_majority_mcq(candidates)
+            else:
+                best = self._pick_best(candidates)
             if self.verify and self._model_calls < self.max_model_calls:
                 verified = self._verify_answer(query, best.answer)
                 best.answer = verified.answer
                 best.checks = verified.checks
                 best.confidence = verified.confidence
+            if self._mcq_letters:
+                best.answer = self._coerce_mcq_answer(best.answer)
             return best
         result = self._run_once(query)
         if self.verify and self._model_calls < self.max_model_calls:
@@ -138,6 +145,8 @@ class Agent:
             result.answer = verified.answer
             result.checks = verified.checks
             result.confidence = verified.confidence
+        if self._mcq_letters:
+            result.answer = self._coerce_mcq_answer(result.answer)
         return result
 
     def _run_once(self, query: str, nonce: str | None = None) -> AgentResult:
@@ -175,7 +184,10 @@ class Agent:
             self.trace.record_messages(self._messages)
 
         tools_enabled, tools_reason = should_enable_tools(query)
-        if not tools_enabled:
+        if self._mcq_letters:
+            tools_enabled = False
+            tools_reason = "mcq"
+        if not tools_enabled and not self._mcq_letters:
             for tool in self.registry.list():
                 if re.search(rf"\b{re.escape(tool.name)}\b", query, re.IGNORECASE):
                     tools_enabled = True
@@ -335,6 +347,8 @@ class Agent:
             protocol_tool_call = isinstance(protocol, ProtocolToolCall)
             if response.final_text is not None and isinstance(protocol, ProtocolFinal):
                 answer = format_final(protocol.answer, protocol.checks)
+                if self._mcq_letters:
+                    answer = self._coerce_mcq_answer(answer)
                 if code_check_enabled:
                     answer = self._code_check_loop(answer)
                 logger.info("Returning final answer from protocol.")
@@ -366,6 +380,8 @@ class Agent:
                     )
                     continue
                 answer = response.final_text
+                if self._mcq_letters:
+                    answer = self._coerce_mcq_answer(answer)
                 if code_check_enabled:
                     answer = self._code_check_loop(answer)
                 logger.info("Returning final answer.")
@@ -547,11 +563,9 @@ class Agent:
             if tool_created:
                 self.tools_created.append(tool_created)
         entry = self.memory.add_tool_output(tool_name, output)
-        rendered_output = self._prepare_tool_output(output)
         payload = {
             "handle": entry.handle,
             "summary": entry.summary,
-            "output": rendered_output,
         }
         content = json.dumps(payload, ensure_ascii=False, default=str)
         if message_role == "tool":
@@ -634,9 +648,34 @@ class Agent:
             confidence = candidate.confidence or 0.0
             check_len = len(candidate.checks)
             answer_len = len(candidate.answer)
-            return (confidence, check_len, answer_len)
+            if confidence <= 0:
+                return (confidence, -answer_len, -check_len)
+            return (confidence, check_len, -answer_len)
 
         return max(candidates, key=score)
+
+    def _pick_majority_mcq(self, candidates: list[AgentResult]) -> AgentResult:
+        letter_votes: dict[str, int] = {}
+        letter_candidates: dict[str, list[AgentResult]] = {}
+        for candidate in candidates:
+            letter = self._extract_mcq_letter(candidate.answer)
+            if not letter:
+                continue
+            letter_votes[letter] = letter_votes.get(letter, 0) + 1
+            letter_candidates.setdefault(letter, []).append(candidate)
+        if not letter_votes:
+            return self._pick_best(candidates)
+        top_count = max(letter_votes.values())
+        top_letters = [letter for letter, count in letter_votes.items() if count == top_count]
+        if len(top_letters) == 1:
+            letter = top_letters[0]
+            best = self._pick_best(letter_candidates[letter])
+            best.answer = self._coerce_mcq_answer(letter)
+            return best
+        tied_candidates = [cand for letter in top_letters for cand in letter_candidates[letter]]
+        best = self._pick_best(tied_candidates)
+        best.answer = self._coerce_mcq_answer(best.answer)
+        return best
 
     def _verify_answer(self, query: str, answer: str) -> AgentResult:
         messages = [
@@ -964,7 +1003,7 @@ class Agent:
             result = tool.run(
                 {
                     "files": files,
-                    "command": f"{sys.executable} {main_file}",
+                    "command": [sys.executable, main_file],
                     "timeout_seconds": 10,
                 }
             )
@@ -979,6 +1018,35 @@ class Agent:
         output = result.output
         error = output.get("error")
         return {"ok": error is None, "error": error}
+
+    def _detect_mcq(self, query: str) -> set[str]:
+        letters: set[str] = set()
+        for match in re.findall(r"(?:^|\s|\()([A-D])[\).:]", query, re.IGNORECASE):
+            letters.add(match.upper())
+        for match in re.findall(r"\(([A-D])\)", query, re.IGNORECASE):
+            letters.add(match.upper())
+        if re.search(r"\bA\s*/\s*B\s*/\s*C", query, re.IGNORECASE):
+            letters.update({"A", "B", "C"})
+        if "D" in query.upper() and {"A", "B", "C"}.issubset(letters):
+            letters.add("D")
+        return letters if len(letters) >= 3 else set()
+
+    def _extract_mcq_letter(self, answer: str) -> str | None:
+        if not answer:
+            return None
+        match = re.search(r"\b([A-D])\b", answer.strip(), re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+        match = re.search(r"([A-D])", answer.strip(), re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+        return None
+
+    def _coerce_mcq_answer(self, answer: str) -> str:
+        letter = self._extract_mcq_letter(answer)
+        if letter:
+            return letter
+        return "A"
 
 
 def protocol_to_toolcall(protocol: ProtocolToolCall) -> "ToolCall":
