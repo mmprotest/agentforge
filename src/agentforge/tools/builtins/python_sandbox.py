@@ -26,6 +26,71 @@ class SandboxResult(BaseModel):
     error: str | None
 
 
+def _has_result_assignment(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if any(isinstance(target, ast.Name) and target.id == "result" for target in node.targets):
+                return True
+        if isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == "result":
+                return True
+        if isinstance(node, ast.NamedExpr):
+            if isinstance(node.target, ast.Name) and node.target.id == "result":
+                return True
+    return False
+
+
+def _prepare_code(code: str) -> ast.AST:
+    tree = ast.parse(code)
+    if not tree.body:
+        return tree
+    if _has_result_assignment(tree):
+        return tree
+    last_statement = tree.body[-1]
+    if isinstance(last_statement, ast.Expr):
+        assign = ast.Assign(
+            targets=[ast.Name(id="result", ctx=ast.Store())],
+            value=last_statement.value,
+        )
+        tree.body[-1] = assign
+        ast.fix_missing_locations(tree)
+    return tree
+
+
+def _run_sandboxed_code(code: str, workspace_dir: str, output: multiprocessing.Queue) -> None:
+    try:
+        sanitized = sanitize_env(os.environ.copy())
+        os.environ.clear()
+        os.environ.update(sanitized)
+        safe_root = Path(workspace_dir).resolve()
+
+        def safe_open(path: str, mode: str = "r"):
+            target = (safe_root / path).resolve()
+            if not str(target).startswith(str(safe_root)):
+                raise ValueError("Sandbox file access outside workspace")
+            return open(target, mode, encoding="utf-8")
+
+        compiled = compile(_prepare_code(code), "<sandbox>", "exec")
+        safe_builtins = {
+            "print": builtins.print,
+            "len": builtins.len,
+            "range": builtins.range,
+            "sum": builtins.sum,
+            "min": builtins.min,
+            "max": builtins.max,
+            "sorted": builtins.sorted,
+            "open": safe_open,
+            "__import__": builtins.__import__,
+        }
+        globals_dict = {"__builtins__": safe_builtins}
+        locals_dict: dict[str, Any] = {}
+        exec(compiled, globals_dict, locals_dict)
+        result = locals_dict.get("result")
+        output.put({"result": result, "error": None})
+    except Exception as exc:  # noqa: BLE001
+        output.put({"result": None, "error": str(exc)})
+
+
 class PythonSandboxTool(Tool):
     name = "python_sandbox"
     description = "Execute small Python snippets in a restricted sandbox."
@@ -38,71 +103,12 @@ class PythonSandboxTool(Tool):
     def _validate_code(self, code: str) -> None:
         ast.parse(code)
 
-    def _safe_open(self, path: str, mode: str = "r"):
-        target = (self.workspace_dir / path).resolve()
-        if not str(target).startswith(str(self.workspace_dir)):
-            raise ValueError("Sandbox file access outside workspace")
-        return open(target, mode, encoding="utf-8")
-
-    def _has_result_assignment(self, tree: ast.AST) -> bool:
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                if any(isinstance(target, ast.Name) and target.id == "result" for target in node.targets):
-                    return True
-            if isinstance(node, ast.AnnAssign):
-                if isinstance(node.target, ast.Name) and node.target.id == "result":
-                    return True
-            if isinstance(node, ast.NamedExpr):
-                if isinstance(node.target, ast.Name) and node.target.id == "result":
-                    return True
-        return False
-
-    def _prepare_code(self, code: str) -> ast.AST:
-        tree = ast.parse(code)
-        if not tree.body:
-            return tree
-        if self._has_result_assignment(tree):
-            return tree
-        last_statement = tree.body[-1]
-        if isinstance(last_statement, ast.Expr):
-            assign = ast.Assign(
-                targets=[ast.Name(id="result", ctx=ast.Store())],
-                value=last_statement.value,
-            )
-            tree.body[-1] = assign
-            ast.fix_missing_locations(tree)
-        return tree
-
-    def _run_code(self, code: str, output: multiprocessing.Queue) -> None:
-        try:
-            sanitized = sanitize_env(os.environ.copy())
-            os.environ.clear()
-            os.environ.update(sanitized)
-            compiled = compile(self._prepare_code(code), "<sandbox>", "exec")
-            safe_builtins = {
-                "print": builtins.print,
-                "len": builtins.len,
-                "range": builtins.range,
-                "sum": builtins.sum,
-                "min": builtins.min,
-                "max": builtins.max,
-                "sorted": builtins.sorted,
-                "open": self._safe_open,
-                "__import__": builtins.__import__,
-            }
-            globals_dict = {"__builtins__": safe_builtins}
-            locals_dict: dict[str, Any] = {}
-            exec(compiled, globals_dict, locals_dict)
-            result = locals_dict.get("result")
-            output.put({"result": result, "error": None})
-        except Exception as exc:  # noqa: BLE001
-            output.put({"result": None, "error": str(exc)})
-
     def run(self, data: BaseModel | dict[str, Any]) -> ToolResult:
         input_data = PythonSandboxInput.model_validate(data)
         output_queue: multiprocessing.Queue = multiprocessing.Queue()
         process = multiprocessing.Process(
-            target=self._run_code, args=(input_data.code, output_queue)
+            target=_run_sandboxed_code,
+            args=(input_data.code, str(self.workspace_dir), output_queue),
         )
         process.start()
         process.join(timeout=input_data.timeout_seconds)

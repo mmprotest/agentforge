@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import os
-import shlex
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agentforge.safety.sandbox import run_command
 from agentforge.tools.base import Tool, ToolResult
@@ -16,8 +15,17 @@ from agentforge.tools.base import Tool, ToolResult
 
 class CodeRunMultiInput(BaseModel):
     files: dict[str, str]
-    command: str
+    command: list[str]
     timeout_seconds: int = Field(default=10, ge=1, le=30)
+
+    @field_validator("command", mode="before")
+    @classmethod
+    def _coerce_command(cls, value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        if isinstance(value, str):
+            return value.split()
+        raise TypeError("command must be a list of strings")
 
 
 class CodeRunMultiTool(Tool):
@@ -39,10 +47,12 @@ class CodeRunMultiTool(Tool):
                 raise ValueError("File path escapes run directory")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
-        command_parts = shlex.split(payload.command)
         env = os.environ.copy()
         result = run_command(
-            command_parts, cwd=run_dir, env=env, timeout_seconds=payload.timeout_seconds
+            payload.command,
+            cwd=run_dir,
+            env=env,
+            timeout_seconds=payload.timeout_seconds,
         )
         return ToolResult(
             output={

@@ -43,6 +43,17 @@ class OpenAICompatChatModel(BaseChatModel):
         self.disable_tool_choice = disable_tool_choice
         self.force_chatcompletions_path = force_chatcompletions_path
         self.transport = transport
+        self._timeout = httpx.Timeout(self.timeout_seconds)
+        self._client = httpx.Client(timeout=self._timeout, transport=self.transport)
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __del__(self) -> None:
+        try:
+            self._client.close()
+        except Exception:
+            pass
 
     def _parse_tool_call(self, message: dict[str, Any]) -> ToolCall | None:
         tool_calls = message.get("tool_calls") or []
@@ -112,13 +123,11 @@ class OpenAICompatChatModel(BaseChatModel):
         url = self._build_url()
         headers = {"Authorization": f"Bearer {self.api_key}", **self.extra_headers}
         payload = self._request_payload(messages, tools)
-        timeout = httpx.Timeout(self.timeout_seconds)
 
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                with httpx.Client(timeout=timeout, transport=self.transport) as client:
-                    response = client.post(url, headers=headers, json=payload)
+                response = self._client.post(url, headers=headers, json=payload)
                 if response.status_code in {429} or response.status_code >= 500:
                     raise OpenAICompatError(
                         f"Retryable error {response.status_code}: "

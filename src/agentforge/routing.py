@@ -50,6 +50,10 @@ _FILE_RE = re.compile(
     re.IGNORECASE,
 )
 _TOOL_REQUEST_RE = re.compile(r"\buse\s+\w+\s+tool\b|\btool\b", re.IGNORECASE)
+_MULTISTEP_RE = re.compile(
+    r"\b(first|second|third|then|next|after|step)\b|[\r\n]+|->|=>",
+    re.IGNORECASE,
+)
 
 
 def tool_candidates(query: str) -> list[RouteSuggestion]:
@@ -106,17 +110,13 @@ def should_enable_tools(query: str) -> tuple[bool, str]:
     normalized = query.strip()
     if not normalized:
         return False, "empty"
-    candidates = tool_candidates(normalized)
-    if candidates:
-        top_candidate = max(candidates, key=lambda candidate: candidate.confidence)
-        return True, f"candidate:{top_candidate.tool_name}"
     if _URL_RE.search(normalized):
         return True, "url"
     if _FILE_RE.search(normalized):
         return True, "file"
     if _TOOL_REQUEST_RE.search(normalized):
         return True, "explicit_tool_request"
-    if _CODE_RE.search(normalized):
+    if _CODE_RE.search(normalized) or _CODE_TASK_RE.search(normalized):
         return True, "code"
     if _ARITH_RE.search(normalized):
         return True, "math"
@@ -126,4 +126,7 @@ def should_enable_tools(query: str) -> tuple[bool, str]:
         return True, "json"
     if _REGEX_RE.search(normalized):
         return True, "regex"
-    return True, "default"
+    is_multistep = bool(_MULTISTEP_RE.search(normalized))
+    if len(normalized) <= 160 and not is_multistep:
+        return False, "short_closed_book"
+    return True, "fallback"
