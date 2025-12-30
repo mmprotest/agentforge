@@ -30,6 +30,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--code-check-max-iters", type=int, dest="code_check_max_iters")
     parser.add_argument("--max-message-chars", type=int, dest="max_message_chars")
     parser.add_argument("--max-turns", type=int, dest="max_turns")
+    parser.add_argument("--tool-vote", action="store_true", dest="tool_vote")
+    parser.add_argument("--tool-vote-k", type=int, dest="tool_vote_k")
+    parser.add_argument("--tool-vote-max-samples", type=int, dest="tool_vote_max_samples")
+    parser.add_argument(
+        "--tool-vote-max-model-calls", type=int, dest="tool_vote_max_model_calls"
+    )
+    parser.add_argument(
+        "--sandbox-allowed-imports", dest="sandbox_allowed_imports"
+    )
     return parser.parse_args()
 
 
@@ -65,6 +74,16 @@ def apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
         data["max_message_chars"] = args.max_message_chars
     if args.max_turns:
         data["max_turns"] = args.max_turns
+    if args.tool_vote:
+        data["tool_vote_enabled"] = True
+    if args.tool_vote_k:
+        data["tool_vote_k"] = args.tool_vote_k
+    if args.tool_vote_max_samples:
+        data["tool_vote_max_samples"] = args.tool_vote_max_samples
+    if args.tool_vote_max_model_calls:
+        data["tool_vote_max_model_calls"] = args.tool_vote_max_model_calls
+    if args.sandbox_allowed_imports:
+        data["sandbox_allowed_imports"] = args.sandbox_allowed_imports
     return Settings(**data)
 
 

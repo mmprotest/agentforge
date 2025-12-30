@@ -116,6 +116,13 @@ def suggest_tool(query: str) -> RouteSuggestion | None:
     return max(candidates, key=lambda candidate: candidate.confidence)
 
 
+def is_route_ambiguous(candidates: list[RouteSuggestion], *, threshold: float = 0.1) -> bool:
+    if len(candidates) < 2:
+        return False
+    ranked = sorted(candidates, key=lambda candidate: candidate.confidence, reverse=True)
+    return (ranked[0].confidence - ranked[1].confidence) <= threshold
+
+
 def is_code_task(query: str) -> bool:
     normalized = query.strip()
     if not normalized:

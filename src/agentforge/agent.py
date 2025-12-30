@@ -22,7 +22,13 @@ from agentforge.protocol import (
 from agentforge.epistemic import EpistemicSource, Fact
 from agentforge.memory import MemoryStore
 from agentforge.problem_state import ProblemState
-from agentforge.routing import is_code_task, should_enable_tools, suggest_tool, tool_candidates
+from agentforge.routing import (
+    is_code_task,
+    is_route_ambiguous,
+    should_enable_tools,
+    suggest_tool,
+    tool_candidates,
+)
 from agentforge.safety.policy import SafetyPolicy
 from agentforge.task_types import EPISTEMIC_REQUIREMENTS, TaskType, determine_task_type
 from agentforge.trace import TraceRecorder
@@ -35,9 +41,6 @@ from agentforge.util.logging import get_logger, redact
 
 
 logger = get_logger(__name__)
-MAX_REFLECTION_ROUNDS = 3
-
-
 @dataclass
 class AgentResult:
     answer: str
@@ -193,8 +196,8 @@ class Agent:
             self._append_message({"role": "system", "content": f"Nonce: {nonce}"})
         self._append_message({"role": "user", "content": query})
 
-        problem_state = self._build_problem_state(query)
-        logger.info("Problem state initialized: %s", redact(self._state_to_json(problem_state)))
+        if self.mode == "deep":
+            self._internal_plan(query)
 
         if self.trace:
             self.trace.record_messages(self._messages)
@@ -228,6 +231,21 @@ class Agent:
         task_type = determine_task_type(query, tools_reason)
         logger.info("Task type determined: %s", task_type.name)
 
+        special_case = (
+            self.verify
+            or self.self_consistency > 1
+            or self.code_check
+            or self._has_strict_format_contract(query)
+        )
+        if (
+            not tools_enabled
+            and tools_reason == "short_closed_book"
+            and not special_case
+        ):
+            fast_path = self._run_fast_path_final(query)
+            if fast_path is not None:
+                return fast_path
+
         remaining_tool_calls = max(0, self.max_tool_calls - self._tool_calls)
         remaining_model_calls = max(0, self.max_model_calls - self._model_calls)
         logger.info(
@@ -235,13 +253,67 @@ class Agent:
             remaining_model_calls,
             remaining_tool_calls,
         )
+        autopilot = self._maybe_autopilot_tool(
+            query,
+            tools_enabled=tools_enabled,
+            tools_reason=tools_reason,
+            remaining_tool_calls=remaining_tool_calls,
+        )
+        if autopilot is not None:
+            return autopilot
+
+        problem_state = self._build_problem_state(query)
+        logger.info("Problem state initialized: %s", redact(self._state_to_json(problem_state)))
+
         return self._run_reflective_loop(
             query,
             problem_state,
             task_type=task_type,
             tools_enabled=tools_enabled,
+            tools_reason=tools_reason,
             remaining_model_calls=remaining_model_calls,
             remaining_tool_calls=remaining_tool_calls,
+        )
+
+    def _run_fast_path_final(self, query: str) -> AgentResult | None:
+        if self._model_calls >= self.max_model_calls:
+            return AgentResult(
+                answer="Reached model call limit",
+                tools_used=self.tools_used,
+                tools_created=self.tools_created,
+                trace_path=self._finalize_trace(),
+            )
+        response = self.model.chat(self._messages, tools=None)
+        self._model_calls += 1
+        if self.trace:
+            tool_payload = (
+                response.tool_call.model_dump()
+                if response.tool_call is not None
+                else None
+            )
+            self.trace.record_model_response(response.final_text, tool_payload)
+        protocol = None
+        if response.final_text:
+            protocol = self._parse_model_protocol(response.final_text)
+        if response.tool_call is None and response.final_text:
+            tool_call = self._parse_tool_call_from_text(response.final_text)
+            if tool_call is not None:
+                response = response.model_copy(update={"tool_call": tool_call})
+        if response.tool_call is not None or isinstance(protocol, ProtocolToolCall):
+            self._pending_model_response = response
+            return None
+        if isinstance(protocol, ProtocolFinal):
+            answer = format_final(protocol.answer, protocol.checks)
+        else:
+            answer = response.final_text or ""
+        answer = answer.strip()
+        if not answer:
+            answer = "No response from model."
+        return AgentResult(
+            answer=answer,
+            tools_used=self.tools_used,
+            tools_created=self.tools_created,
+            trace_path=self._finalize_trace(),
         )
 
     def _build_problem_state(self, query: str) -> ProblemState:
@@ -302,12 +374,19 @@ class Agent:
         *,
         task_type: TaskType,
         tools_enabled: bool,
+        tools_reason: str,
         remaining_model_calls: int,
         remaining_tool_calls: int,
     ) -> AgentResult:
         candidates: list[tuple[str, ProblemState]] = []
         code_check_enabled = self.code_check and is_code_task(query)
         used_router = False
+        short_task = tools_reason == "short_closed_book"
+        ambiguous_tool_vote = (
+            tools_enabled
+            and self.policy.tool_vote_enabled
+            and is_route_ambiguous(tool_candidates(query))
+        )
         if tools_enabled:
             suggestion = suggest_tool(query)
             if suggestion and not used_router:
@@ -323,7 +402,7 @@ class Agent:
                     }
                 )
                 used_router = True
-        for round_index in range(MAX_REFLECTION_ROUNDS):
+        for step_index in range(self.max_steps):
             if remaining_model_calls <= 0:
                 return AgentResult(
                     answer="Reached model call limit",
@@ -337,6 +416,8 @@ class Agent:
                 step_desc,
                 tools_enabled=tools_enabled,
                 remaining_tool_calls=remaining_tool_calls,
+                remaining_model_calls=remaining_model_calls,
+                ambiguous_tool_vote=ambiguous_tool_vote,
             )
             remaining_tool_calls = max(0, self.max_tool_calls - self._tool_calls)
             remaining_model_calls = max(0, self.max_model_calls - self._model_calls)
@@ -389,7 +470,12 @@ class Agent:
                     )
                 problem_state.unknowns = ["Need additional evidence for epistemic justification."]
                 problem_state.candidate_solution = None
-            if round_index == 0 and not problem_state.candidate_solution and problem_state.unknowns:
+            if (
+                step_index == 0
+                and not problem_state.candidate_solution
+                and problem_state.unknowns
+                and remaining_model_calls >= 4
+            ):
                 alternative_paths = self._generate_alternative_paths(problem_state, count=2)
                 for idx, alt_state in enumerate(alternative_paths):
                     logger.info("Exploring alternative path %s: %s", idx + 1, redact(json.dumps(alt_state.plan)))
@@ -431,9 +517,33 @@ class Agent:
                 trace_path=self._finalize_trace(),
             )
 
-        confidence, confidence_reason = self._estimate_confidence(best_state, best_solution)
+        if remaining_model_calls >= 2:
+            confidence, confidence_reason = self._estimate_confidence(best_state, best_solution)
+        else:
+            confidence = 0.7
+            confidence_reason = "Confidence estimate skipped due to limited model calls."
         best_state.confidence = confidence
+
+        final_answer = best_solution
+        if code_check_enabled:
+            final_answer = self._code_check_loop(final_answer)
+        if self._mcq_letters:
+            final_answer = self._coerce_mcq_answer(final_answer)
         if confidence < 0.6:
+            if short_task:
+                checks = []
+                if confidence_reason:
+                    checks.append(f"Low confidence: {confidence_reason}")
+                else:
+                    checks.append("Low confidence")
+                return AgentResult(
+                    answer=final_answer,
+                    tools_used=self.tools_used,
+                    tools_created=self.tools_created,
+                    checks=checks,
+                    confidence=confidence,
+                    trace_path=self._finalize_trace(),
+                )
             refusal = "I am not confident enough to provide a definitive answer."
             if confidence_reason:
                 refusal = f"{refusal} {confidence_reason}"
@@ -444,12 +554,6 @@ class Agent:
                 confidence=confidence,
                 trace_path=self._finalize_trace(),
             )
-
-        final_answer = best_solution
-        if code_check_enabled:
-            final_answer = self._code_check_loop(final_answer)
-        if self._mcq_letters:
-            final_answer = self._coerce_mcq_answer(final_answer)
         return AgentResult(
             answer=final_answer,
             tools_used=self.tools_used,
@@ -465,6 +569,8 @@ class Agent:
         *,
         tools_enabled: bool,
         remaining_tool_calls: int,
+        remaining_model_calls: int,
+        ambiguous_tool_vote: bool,
     ) -> StepOutcome:
         self._append_message(
             {
@@ -498,6 +604,15 @@ class Agent:
             tool_call = self._parse_tool_call_from_text(response.final_text)
             if tool_call is not None:
                 response = response.model_copy(update={"tool_call": tool_call})
+        if tools_enabled and ambiguous_tool_vote:
+            elected, remaining_model_calls = self._maybe_vote_tool_call(
+                tools,
+                response,
+                remaining_model_calls,
+                ambiguous=True,
+            )
+            if elected is not None:
+                response = response.model_copy(update={"tool_call": elected})
         if response.tool_call is None:
             if isinstance(protocol, ProtocolFinal):
                 answer = format_final(protocol.answer, protocol.checks)
@@ -535,6 +650,46 @@ class Agent:
                 response.tool_call.arguments
             ).model_dump()
         except ValidationError as exc:
+            elected, remaining_model_calls = self._maybe_vote_tool_call(
+                tools,
+                response,
+                remaining_model_calls,
+                schema_error=True,
+            )
+            if elected is not None:
+                tool = self.registry.get(elected.name)
+                if tool is None or not self.policy.is_tool_allowed(elected.name):
+                    return StepOutcome(
+                        step_summary=(
+                            "Tool vote elected an unknown or disallowed tool "
+                            f"{elected.name}."
+                        ),
+                        failure_reason="tool_unavailable",
+                    )
+                output, ok, _schema_error = self._execute_tool(tool, elected.arguments)
+                self._handle_tool_result(
+                    tool.name,
+                    output,
+                    response.tool_call.id if response.tool_call else None,
+                    elected.arguments,
+                )
+                self._tool_calls += 1
+                summary = f"Tool {tool.name} returned: {self.memory.entries[-1].summary}"
+                fact = Fact(
+                    content=self.memory.entries[-1].summary,
+                    source=self._tool_epistemic_source(tool.name),
+                    provenance=tool.name,
+                )
+                if ok is False:
+                    return StepOutcome(
+                        step_summary=summary,
+                        failure_reason="tool_failed",
+                        fact=fact,
+                    )
+                return StepOutcome(
+                    step_summary=f"Recovered tool call via voting: {summary}",
+                    fact=fact,
+                )
             output = self._tool_error_payload(tool, exc, schema_error=True)
             self._handle_tool_result(
                 tool_name,
@@ -1056,6 +1211,79 @@ class Agent:
                     "to_unit": match.group(3),
                 }
         return None
+
+    def _maybe_autopilot_tool(
+        self,
+        query: str,
+        *,
+        tools_enabled: bool,
+        tools_reason: str,
+        remaining_tool_calls: int,
+    ) -> AgentResult | None:
+        if not tools_enabled or remaining_tool_calls <= 0:
+            return None
+        deterministic_tools = {"calculator", "unit_convert", "json_repair"}
+        tool_name: str | None = None
+        if tools_reason in {"math", "unit", "json"}:
+            tool_name = {
+                "math": "calculator",
+                "unit": "unit_convert",
+                "json": "json_repair",
+            }.get(tools_reason)
+        if tool_name is None:
+            suggestion = suggest_tool(query)
+            if (
+                suggestion
+                and suggestion.confidence >= 0.75
+                and suggestion.tool_name in deterministic_tools
+            ):
+                tool_name = suggestion.tool_name
+        if tool_name is None or tool_name not in deterministic_tools:
+            return None
+        tool = self.registry.get(tool_name)
+        if tool is None or not self.policy.is_tool_allowed(tool_name):
+            return None
+        args = self._direct_tool_args(tool_name, query)
+        if args is None:
+            return None
+        try:
+            validated_args = tool.input_schema.model_validate(args).model_dump()
+        except ValidationError:
+            return None
+        output, ok, _schema_error = self._execute_tool(tool, validated_args)
+        if ok is False:
+            return None
+        if tool_name == "json_repair" and isinstance(output, dict) and output.get("error"):
+            return None
+        self._handle_tool_result(
+            tool_name,
+            output,
+            arguments=validated_args,
+            message_role="system",
+            explanation="Auto-executed deterministic tool.",
+        )
+        self._tool_calls += 1
+        if tool_name == "calculator":
+            answer = str((output or {}).get("value", "")).strip()
+        elif tool_name == "unit_convert":
+            value = (output or {}).get("value")
+            unit = (output or {}).get("unit")
+            answer = str(value)
+            if unit:
+                answer = f"{answer} {unit}"
+        else:
+            value = (output or {}).get("value")
+            if isinstance(value, (dict, list)):
+                answer = json.dumps(value, ensure_ascii=False)
+            else:
+                answer = str(value)
+        answer = answer.strip() or "No result from tool."
+        return AgentResult(
+            answer=answer,
+            tools_used=self.tools_used,
+            tools_created=self.tools_created,
+            trace_path=self._finalize_trace(),
+        )
 
     def _has_strict_format_contract(self, query: str) -> bool:
         patterns = [r"\breturn\b", r"format:", r"answer only", r"answer exactly"]

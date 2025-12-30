@@ -54,10 +54,27 @@ class Settings(BaseSettings):
     trim_strategy: Literal["drop_oldest"] = Field(
         default="drop_oldest", validation_alias="TRIM_STRATEGY"
     )
+    tool_vote_enabled: bool = Field(
+        default=False, validation_alias="TOOL_VOTE_ENABLED"
+    )
+    tool_vote_k: int = Field(default=2, validation_alias="TOOL_VOTE_K")
+    tool_vote_max_samples: int = Field(
+        default=7, validation_alias="TOOL_VOTE_MAX_SAMPLES"
+    )
+    tool_vote_max_model_calls: int = Field(
+        default=7, validation_alias="TOOL_VOTE_MAX_MODEL_CALLS"
+    )
     strict_json_mode: bool = Field(default=False, validation_alias="STRICT_JSON_MODE")
     code_check: bool = Field(default=False, validation_alias="CODE_CHECK")
     code_check_max_iters: int = Field(
         default=2, validation_alias="CODE_CHECK_MAX_ITERS"
+    )
+    sandbox_allowed_imports: str = Field(
+        default=(
+            "math,re,json,datetime,statistics,random,decimal,"
+            "fractions,itertools,functools"
+        ),
+        validation_alias="SANDBOX_ALLOWED_IMPORTS",
     )
     sandbox_passthrough_env: str | None = Field(
         default=None, validation_alias="SANDBOX_PASSTHROUGH_ENV"
