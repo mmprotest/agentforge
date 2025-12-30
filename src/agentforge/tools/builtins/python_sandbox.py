@@ -57,7 +57,12 @@ def _prepare_code(code: str) -> ast.AST:
     return tree
 
 
-def _run_sandboxed_code(code: str, workspace_dir: str, output: multiprocessing.Queue) -> None:
+def _run_sandboxed_code(
+    code: str,
+    workspace_dir: str,
+    output: multiprocessing.Queue,
+    allowed_imports: set[str],
+) -> None:
     try:
         sanitized = sanitize_env(os.environ.copy())
         os.environ.clear()
@@ -71,6 +76,21 @@ def _run_sandboxed_code(code: str, workspace_dir: str, output: multiprocessing.Q
             return open(target, mode, encoding="utf-8")
 
         compiled = compile(_prepare_code(code), "<sandbox>", "exec")
+
+        def safe_import(
+            name: str,
+            globals: dict[str, Any] | None = None,
+            locals: dict[str, Any] | None = None,
+            fromlist: tuple[str, ...] | list[str] = (),
+            level: int = 0,
+        ):
+            if level != 0:
+                raise ImportError(f"Import blocked: {name}")
+            top_level = name.split(".")[0].lower()
+            if top_level not in allowed_imports:
+                raise ImportError(f"Import blocked: {name}")
+            return builtins.__import__(name, globals, locals, fromlist, level)
+
         safe_builtins = {
             "print": builtins.print,
             "len": builtins.len,
@@ -80,7 +100,7 @@ def _run_sandboxed_code(code: str, workspace_dir: str, output: multiprocessing.Q
             "max": builtins.max,
             "sorted": builtins.sorted,
             "open": safe_open,
-            "__import__": builtins.__import__,
+            "__import__": safe_import,
         }
         globals_dict = {"__builtins__": safe_builtins}
         locals_dict: dict[str, Any] = {}
@@ -91,14 +111,31 @@ def _run_sandboxed_code(code: str, workspace_dir: str, output: multiprocessing.Q
         output.put({"result": None, "error": str(exc)})
 
 
+DEFAULT_ALLOWED_IMPORTS = {
+    "math",
+    "re",
+    "json",
+    "datetime",
+    "statistics",
+    "random",
+    "decimal",
+    "fractions",
+    "itertools",
+    "functools",
+}
+
+
 class PythonSandboxTool(Tool):
     name = "python_sandbox"
     description = "Execute small Python snippets in a restricted sandbox."
     input_schema = PythonSandboxInput
 
-    def __init__(self, workspace_dir: str) -> None:
+    def __init__(self, workspace_dir: str, allowed_imports: set[str] | list[str] | None = None) -> None:
         self.workspace_dir = Path(workspace_dir).resolve()
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        if allowed_imports is None:
+            allowed_imports = DEFAULT_ALLOWED_IMPORTS
+        self.allowed_imports = {item.lower() for item in allowed_imports}
 
     def _validate_code(self, code: str) -> None:
         ast.parse(code)
@@ -108,7 +145,12 @@ class PythonSandboxTool(Tool):
         output_queue: multiprocessing.Queue = multiprocessing.Queue()
         process = multiprocessing.Process(
             target=_run_sandboxed_code,
-            args=(input_data.code, str(self.workspace_dir), output_queue),
+            args=(
+                input_data.code,
+                str(self.workspace_dir),
+                output_queue,
+                self.allowed_imports,
+            ),
         )
         process.start()
         process.join(timeout=input_data.timeout_seconds)

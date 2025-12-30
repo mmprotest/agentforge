@@ -96,9 +96,14 @@ Environment variables (CLI flags override env vars):
 - `MAX_MESSAGE_CHARS` (default `24000`)
 - `MAX_TURNS` (default `20`)
 - `TRIM_STRATEGY` (default `drop_oldest`)
+- `TOOL_VOTE_ENABLED` (default `false`)
+- `TOOL_VOTE_K` (default `2`)
+- `TOOL_VOTE_MAX_SAMPLES` (default `7`)
+- `TOOL_VOTE_MAX_MODEL_CALLS` (default `7`)
 - `STRICT_JSON_MODE` (default `false`)
 - `CODE_CHECK` (default `false`)
 - `CODE_CHECK_MAX_ITERS` (default `2`)
+- `SANDBOX_ALLOWED_IMPORTS` (comma-separated allowlist of Python imports)
 - `SANDBOX_PASSTHROUGH_ENV` (comma-separated allowlist of extra env vars)
 
 Recommended small-model settings:
@@ -121,7 +126,7 @@ Tool creation is disabled by default. Enable it by setting `ALLOW_TOOL_CREATION=
 ## Threat model
 AgentForge assumes:
 - Untrusted model output: tool code and arguments are validated and sandboxed.
-- Tools are confined: filesystem access is limited to the workspace, Python sandbox blocks imports and enforces timeouts.
+- Tools are confined: filesystem access is limited to the workspace, Python sandbox allows imports only from a small allowlist (configurable via `SANDBOX_ALLOWED_IMPORTS`) and enforces timeouts.
 - Network exposure is explicit: only the `http_fetch` tool can perform outbound requests.
 - `code_run_multi` executes code in a temporary workspace directory; do not provide secrets or untrusted system commands.
 - Secrets are redacted in logs where possible.

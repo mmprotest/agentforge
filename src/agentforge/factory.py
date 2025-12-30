@@ -47,9 +47,14 @@ def build_registry(
     settings: Settings, model: BaseChatModel, include_tool_maker: bool | None = None
 ) -> ToolRegistry:
     registry = ToolRegistry()
+    allowed_imports = {
+        item.strip().lower()
+        for item in (settings.sandbox_allowed_imports or "").split(",")
+        if item.strip()
+    }
     registry.register(HttpFetchTool())
     registry.register(FileSystemTool(settings.workspace_dir))
-    registry.register(PythonSandboxTool(settings.workspace_dir))
+    registry.register(PythonSandboxTool(settings.workspace_dir, allowed_imports=allowed_imports))
     registry.register(DeepThinkTool())
     registry.register(CalculatorTool())
     registry.register(RegexExtractTool())
@@ -76,6 +81,10 @@ def build_policy(settings: Settings) -> SafetyPolicy:
         max_steps=settings.max_steps,
         max_tool_calls=settings.max_tool_calls,
         max_model_calls=settings.max_model_calls,
+        tool_vote_enabled=settings.tool_vote_enabled,
+        tool_vote_k=settings.tool_vote_k,
+        tool_vote_max_samples=settings.tool_vote_max_samples,
+        tool_vote_max_model_calls=settings.tool_vote_max_model_calls,
     )
 
 
