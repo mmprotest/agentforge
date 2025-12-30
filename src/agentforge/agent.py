@@ -19,10 +19,12 @@ from agentforge.protocol import (
     parse_protocol,
     protocol_from_payload,
 )
+from agentforge.epistemic import EpistemicSource, Fact
 from agentforge.memory import MemoryStore
 from agentforge.problem_state import ProblemState
 from agentforge.routing import is_code_task, should_enable_tools, suggest_tool, tool_candidates
 from agentforge.safety.policy import SafetyPolicy
+from agentforge.task_types import EPISTEMIC_REQUIREMENTS, TaskType, determine_task_type
 from agentforge.trace import TraceRecorder
 from agentforge.tools.base import Tool
 from agentforge.tools.builtins.deep_think import DeepThinkTool
@@ -51,6 +53,7 @@ class StepOutcome:
     step_summary: str
     candidate_solution: str | None = None
     failure_reason: str | None = None
+    fact: Fact | None = None
 
 
 class Agent:
@@ -98,6 +101,7 @@ class Agent:
         self._model_calls = 0
         self._tool_calls = 0
         self._pending_tool_call_response = None
+        self._pending_model_response = None
         self._mcq_letters: set[str] = set()
 
     def _internal_plan(self, query: str) -> None:
@@ -221,6 +225,9 @@ class Agent:
         elif tools_reason == "deterministic_compute":
             logger.info("Controller enabled tools (deterministic_compute).")
 
+        task_type = determine_task_type(query, tools_reason)
+        logger.info("Task type determined: %s", task_type.name)
+
         remaining_tool_calls = max(0, self.max_tool_calls - self._tool_calls)
         remaining_model_calls = max(0, self.max_model_calls - self._model_calls)
         logger.info(
@@ -231,6 +238,7 @@ class Agent:
         return self._run_reflective_loop(
             query,
             problem_state,
+            task_type=task_type,
             tools_enabled=tools_enabled,
             remaining_model_calls=remaining_model_calls,
             remaining_tool_calls=remaining_tool_calls,
@@ -252,13 +260,37 @@ class Agent:
             return ProblemState(objective=query)
         response = self.model.chat(messages, tools=None)
         self._model_calls += 1
+        protocol = None
+        if response.final_text:
+            protocol = self._parse_model_protocol(response.final_text)
+        if response.tool_call is not None:
+            self._pending_model_response = response
+            return ProblemState(objective=query)
         payload = self._parse_json_payload(response.final_text or "")
         if not isinstance(payload, dict):
+            if isinstance(protocol, ProtocolToolCall):
+                if not self.policy.red_flag_strict_json or response.final_text.lstrip().startswith("{"):
+                    self._pending_model_response = response
+            elif isinstance(protocol, ProtocolFinal):
+                self._pending_model_response = response
             return ProblemState(objective=query)
+        expected_keys = {"constraints", "known_facts", "unknowns", "plan"}
+        if not expected_keys.intersection(payload.keys()):
+            payload_type = payload.get("type") if isinstance(payload, dict) else None
+            if isinstance(protocol, ProtocolToolCall) or payload_type == "tool":
+                if not self.policy.red_flag_strict_json or response.final_text.lstrip().startswith("{"):
+                    self._pending_model_response = response
+            elif isinstance(protocol, ProtocolFinal) or payload_type == "final":
+                self._pending_model_response = response
+            return ProblemState(objective=query)
+        assumed_facts = [
+            Fact(content=str(item), source=EpistemicSource.ASSUMED, provenance="initial_analysis")
+            for item in payload.get("known_facts") or []
+        ]
         return ProblemState(
             objective=query,
             constraints=[str(item) for item in payload.get("constraints") or []],
-            known_facts=[str(item) for item in payload.get("known_facts") or []],
+            known_facts=assumed_facts,
             unknowns=[str(item) for item in payload.get("unknowns") or []],
             plan=[str(item) for item in payload.get("plan") or []],
         )
@@ -268,6 +300,7 @@ class Agent:
         query: str,
         problem_state: ProblemState,
         *,
+        task_type: TaskType,
         tools_enabled: bool,
         remaining_model_calls: int,
         remaining_tool_calls: int,
@@ -307,8 +340,8 @@ class Agent:
             )
             remaining_tool_calls = max(0, self.max_tool_calls - self._tool_calls)
             remaining_model_calls = max(0, self.max_model_calls - self._model_calls)
-            if outcome.step_summary:
-                problem_state.known_facts.append(outcome.step_summary)
+            if outcome.fact is not None:
+                problem_state.known_facts.append(outcome.fact)
             if outcome.candidate_solution:
                 problem_state.candidate_solution = outcome.candidate_solution
                 candidates.append((outcome.candidate_solution, problem_state))
@@ -326,9 +359,8 @@ class Agent:
                     redact(str(reason) if reason is not None else ""),
                 )
                 if reflection.get("known_facts"):
-                    problem_state.known_facts.extend(
-                        [str(item) for item in reflection.get("known_facts") or []]
-                    )
+                    inferred = self._parse_inferred_facts(reflection.get("known_facts"))
+                    problem_state.known_facts.extend(inferred)
                 if reflection.get("unknowns") is not None:
                     problem_state.unknowns = [
                         str(item) for item in reflection.get("unknowns") or []
@@ -340,14 +372,30 @@ class Agent:
                         logger.info("Plan revised: %s", redact(json.dumps(problem_state.plan)))
                     logger.info("Reflection indicated lack of progress: %s", redact(reason or ""))
             if problem_state.candidate_solution and not problem_state.unknowns:
-                break
+                epistemic_ok = self._ensure_epistemic_validity(
+                    problem_state,
+                    task_type,
+                    remaining_model_calls=remaining_model_calls,
+                    remaining_tool_calls=remaining_tool_calls,
+                )
+                if epistemic_ok:
+                    break
+                if remaining_model_calls <= 0 and remaining_tool_calls <= 0:
+                    return AgentResult(
+                        answer="Cannot justify answer with acceptable evidence.",
+                        tools_used=self.tools_used,
+                        tools_created=self.tools_created,
+                        trace_path=self._finalize_trace(),
+                    )
+                problem_state.unknowns = ["Need additional evidence for epistemic justification."]
+                problem_state.candidate_solution = None
             if round_index == 0 and not problem_state.candidate_solution and problem_state.unknowns:
                 alternative_paths = self._generate_alternative_paths(problem_state, count=2)
                 for idx, alt_state in enumerate(alternative_paths):
                     logger.info("Exploring alternative path %s: %s", idx + 1, redact(json.dumps(alt_state.plan)))
                     alt_outcome = self._execute_alternative_step(query, alt_state)
-                    if alt_outcome.step_summary:
-                        alt_state.known_facts.append(alt_outcome.step_summary)
+                    if alt_outcome.fact is not None:
+                        alt_state.known_facts.append(alt_outcome.fact)
                     if alt_outcome.candidate_solution:
                         alt_state.candidate_solution = alt_outcome.candidate_solution
                         candidates.append((alt_outcome.candidate_solution, alt_state))
@@ -368,6 +416,20 @@ class Agent:
             best_solution, best_state = candidates[0]
         else:
             best_solution, best_state = verified
+
+        epistemic_ok = self._ensure_epistemic_validity(
+            best_state,
+            task_type,
+            remaining_model_calls=remaining_model_calls,
+            remaining_tool_calls=remaining_tool_calls,
+        )
+        if not epistemic_ok:
+            return AgentResult(
+                answer="Cannot justify answer with acceptable evidence.",
+                tools_used=self.tools_used,
+                tools_created=self.tools_created,
+                trace_path=self._finalize_trace(),
+            )
 
         confidence, confidence_reason = self._estimate_confidence(best_state, best_solution)
         best_state.confidence = confidence
@@ -416,8 +478,12 @@ class Agent:
         tools = self.registry.openai_schemas() if tools_enabled else None
         if self._model_calls >= self.max_model_calls:
             return StepOutcome(step_summary="Model call limit reached.", failure_reason="limit")
-        response = self.model.chat(self._messages, tools=tools)
-        self._model_calls += 1
+        if self._pending_model_response is not None:
+            response = self._pending_model_response
+            self._pending_model_response = None
+        else:
+            response = self.model.chat(self._messages, tools=tools)
+            self._model_calls += 1
         if self.trace:
             tool_payload = (
                 response.tool_call.model_dump()
@@ -489,9 +555,14 @@ class Agent:
         self._handle_tool_result(tool_name, output, response.tool_call.id, validated_args)
         self._tool_calls += 1
         summary = f"Tool {tool_name} returned: {self.memory.entries[-1].summary}"
+        fact = Fact(
+            content=self.memory.entries[-1].summary,
+            source=self._tool_epistemic_source(tool_name),
+            provenance=tool_name,
+        )
         if ok is False:
-            return StepOutcome(step_summary=summary, failure_reason="tool_failed")
-        return StepOutcome(step_summary=summary)
+            return StepOutcome(step_summary=summary, failure_reason="tool_failed", fact=fact)
+        return StepOutcome(step_summary=summary, fact=fact)
 
     def _reflect_on_step(
         self,
@@ -507,7 +578,8 @@ class Agent:
                     "Given the current problem state, did the last step reduce "
                     "uncertainty or advance the solution? If not, explain why and "
                     "revise the plan. Return JSON with keys: advanced, reason, plan, "
-                    "known_facts, unknowns."
+                    "known_facts, unknowns. When adding known_facts, return objects "
+                    "with 'content' and optional 'provenance' that reference earlier facts."
                 ),
             },
             {
@@ -522,6 +594,17 @@ class Agent:
         self._model_calls += 1
         payload = self._parse_json_payload(response.final_text or "")
         if not isinstance(payload, dict):
+            if response.final_text:
+                protocol = self._parse_model_protocol(response.final_text)
+                if isinstance(protocol, (ProtocolFinal, ProtocolToolCall)):
+                    self._pending_model_response = response
+            return None
+        expected_keys = {"advanced", "reason", "plan", "known_facts", "unknowns"}
+        if not expected_keys.intersection(payload.keys()):
+            if response.final_text:
+                protocol = self._parse_model_protocol(response.final_text)
+                if isinstance(protocol, (ProtocolFinal, ProtocolToolCall)):
+                    self._pending_model_response = response
             return None
         return payload
 
@@ -590,7 +673,7 @@ class Agent:
         payload = {
             "objective": problem_state.objective,
             "constraints": problem_state.constraints,
-            "known_facts": problem_state.known_facts,
+            "known_facts": [self._fact_to_payload(fact) for fact in problem_state.known_facts],
             "candidates": [
                 {"index": idx, "solution": solution}
                 for idx, (solution, _state) in enumerate(candidates)
@@ -636,7 +719,7 @@ class Agent:
         self, problem_state: ProblemState, solution: str
     ) -> tuple[float, str | None]:
         if self._model_calls >= self.max_model_calls:
-            return 0.0, "Confidence could not be estimated."
+            return 0.7, "Confidence could not be estimated."
         messages = [
             {
                 "role": "system",
@@ -651,7 +734,7 @@ class Agent:
                 "content": (
                     f"Objective: {problem_state.objective}\n"
                     f"Constraints: {problem_state.constraints}\n"
-                    f"Known facts: {problem_state.known_facts}\n"
+                    f"Known facts: {[self._fact_to_payload(fact) for fact in problem_state.known_facts]}\n"
                     f"Solution: {solution}"
                 ),
             },
@@ -660,13 +743,13 @@ class Agent:
         self._model_calls += 1
         payload = self._parse_json_payload(response.final_text or "")
         if not isinstance(payload, dict):
-            return 0.0, None
+            return 0.7, "Confidence could not be estimated."
         confidence = payload.get("confidence", 0.0)
         reason = payload.get("reason")
         try:
             confidence_value = float(confidence)
         except (TypeError, ValueError):
-            confidence_value = 0.0
+            confidence_value = 0.7
         return confidence_value, str(reason) if reason else None
 
     def _parse_json_payload(self, content: str) -> dict[str, Any] | None:
@@ -683,16 +766,200 @@ class Agent:
             return None
         return payload
 
+    def _tool_epistemic_source(self, tool_name: str) -> EpistemicSource:
+        observed_tools = {"http_fetch", "filesystem", "web_search"}
+        derived_tools = {
+            "calculator",
+            "python_sandbox",
+            "code_run_multi",
+            "unit_convert",
+            "json_repair",
+            "regex_extract",
+        }
+        if tool_name in observed_tools or re.search(r"(fetch|search|scrape)", tool_name):
+            return EpistemicSource.OBSERVED
+        if tool_name in derived_tools:
+            return EpistemicSource.DERIVED
+        return EpistemicSource.DERIVED
+
+    def _collect_answer_facts(self, problem_state: ProblemState, solution: str) -> list[Fact]:
+        if self._model_calls >= self.max_model_calls:
+            return []
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "List the minimal facts required to justify the answer. "
+                    "For each fact, specify whether it is assumed, observed, "
+                    "derived, inferred, or validated. Return JSON with key "
+                    "'facts' as a list of objects with content, source, provenance."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Known facts: {[self._fact_to_payload(fact) for fact in problem_state.known_facts]}\n"
+                    f"Answer: {solution}"
+                ),
+            },
+        ]
+        response = self.model.chat(messages, tools=None)
+        self._model_calls += 1
+        payload = self._parse_json_payload(response.final_text or "")
+        items = (payload or {}).get("facts") or []
+        facts: list[Fact] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            source = item.get("source")
+            provenance = item.get("provenance")
+            if not content or not source:
+                continue
+            source_enum = self._normalize_source(str(source))
+            if source_enum is None:
+                continue
+            facts.append(
+                Fact(
+                    content=str(content),
+                    source=source_enum,
+                    provenance=str(provenance) if provenance else None,
+                )
+            )
+        return facts
+
+    def _fallback_answer_facts(self, solution: str, known_facts: list[Fact]) -> list[Fact]:
+        if known_facts:
+            return list(known_facts)
+        if solution.strip():
+            return [
+                Fact(
+                    content=solution.strip(),
+                    source=EpistemicSource.INFERRED,
+                    provenance="fallback_from_answer",
+                )
+            ]
+        return []
+
+    def _normalize_source(self, source: str) -> EpistemicSource | None:
+        normalized = source.strip().upper()
+        for candidate in EpistemicSource:
+            if candidate.name == normalized:
+                return candidate
+        return None
+
+    def _validate_extraction_facts(
+        self, answer_facts: list[Fact], known_facts: list[Fact]
+    ) -> list[Fact]:
+        validated: list[Fact] = []
+        known_contents = [fact.content for fact in known_facts]
+        for fact in answer_facts:
+            if any(fact.content in known for known in known_contents):
+                validated.append(
+                    Fact(
+                        content=fact.content,
+                        source=EpistemicSource.VALIDATED,
+                        provenance="validated_by_substring",
+                    )
+                )
+        return validated
+
+    def _ensure_epistemic_validity(
+        self,
+        problem_state: ProblemState,
+        task_type: TaskType,
+        *,
+        remaining_model_calls: int,
+        remaining_tool_calls: int,
+    ) -> bool:
+        solution = problem_state.candidate_solution or ""
+        if remaining_model_calls > 2:
+            answer_facts = self._collect_answer_facts(problem_state, solution)
+        else:
+            answer_facts = []
+        if not answer_facts:
+            answer_facts = self._fallback_answer_facts(solution, problem_state.known_facts)
+        if task_type == TaskType.EXTRACTION:
+            answer_facts = self._validate_extraction_facts(answer_facts, problem_state.known_facts)
+        problem_state.answer_facts = answer_facts
+        allowed_sources = EPISTEMIC_REQUIREMENTS.get(task_type, set())
+        if not answer_facts:
+            self._log_epistemic_summary(problem_state, task_type, passed=False)
+            return False
+        for fact in answer_facts:
+            if fact.source not in allowed_sources:
+                self._log_epistemic_summary(problem_state, task_type, passed=False)
+                return False
+        if task_type == TaskType.DETERMINISTIC_COMPUTE:
+            if not any(fact.source == EpistemicSource.DERIVED for fact in answer_facts):
+                self._log_epistemic_summary(problem_state, task_type, passed=False)
+                return False
+        if task_type == TaskType.EXTRACTION:
+            if not answer_facts or any(
+                fact.source != EpistemicSource.VALIDATED for fact in answer_facts
+            ):
+                self._log_epistemic_summary(problem_state, task_type, passed=False)
+                return False
+        self._log_epistemic_summary(problem_state, task_type, passed=True)
+        return True
+
+    def _log_epistemic_summary(
+        self, problem_state: ProblemState, task_type: TaskType, *, passed: bool
+    ) -> None:
+        known_payload = [self._fact_to_payload(fact) for fact in problem_state.known_facts]
+        answer_payload = [self._fact_to_payload(fact) for fact in problem_state.answer_facts]
+        logger.info("Epistemic summary: task_type=%s", task_type.name)
+        logger.info("Epistemic known facts: %s", redact(json.dumps(known_payload, ensure_ascii=False)))
+        logger.info(
+            "Epistemic answer facts: %s",
+            redact(json.dumps(answer_payload, ensure_ascii=False)),
+        )
+        logger.info("Epistemic justification: %s", "PASS" if passed else "FAIL")
+
     def _state_to_json(self, problem_state: ProblemState) -> str:
         payload = {
             "objective": problem_state.objective,
             "constraints": problem_state.constraints,
-            "known_facts": problem_state.known_facts,
+            "known_facts": [self._fact_to_payload(fact) for fact in problem_state.known_facts],
             "unknowns": problem_state.unknowns,
             "plan": problem_state.plan,
             "failure_reason": problem_state.failure_reason,
         }
         return json.dumps(payload, ensure_ascii=False)
+
+    def _fact_to_payload(self, fact: Fact) -> dict[str, Any]:
+        return {
+            "content": fact.content,
+            "source": fact.source.name,
+            "provenance": fact.provenance,
+        }
+
+    def _parse_inferred_facts(self, items: Any) -> list[Fact]:
+        facts: list[Fact] = []
+        if not isinstance(items, list):
+            return facts
+        for item in items:
+            if isinstance(item, dict):
+                content = item.get("content")
+                if content is None:
+                    continue
+                provenance = item.get("provenance")
+                facts.append(
+                    Fact(
+                        content=str(content),
+                        source=EpistemicSource.INFERRED,
+                        provenance=str(provenance) if provenance else "reflection",
+                    )
+                )
+            else:
+                facts.append(
+                    Fact(
+                        content=str(item),
+                        source=EpistemicSource.INFERRED,
+                        provenance="reflection",
+                    )
+                )
+        return facts
 
     def _handle_tool_result(
         self,
@@ -1127,10 +1394,14 @@ class Agent:
                     ),
                 }
             )
-            if self._model_calls >= self.max_model_calls:
-                return current_answer
-            response = self.model.chat(self._messages, tools=None)
-            self._model_calls += 1
+            if self._pending_model_response is not None:
+                response = self._pending_model_response
+                self._pending_model_response = None
+            else:
+                if self._model_calls >= self.max_model_calls:
+                    return current_answer
+                response = self.model.chat(self._messages, tools=None)
+                self._model_calls += 1
             if self.trace:
                 tool_payload = (
                     response.tool_call.model_dump()
