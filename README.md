@@ -3,7 +3,7 @@
 AgentForge is a production-ready Python 3.11+ repository that implements an agent capable of using tools and creating tools with an OpenAI-compatible model backend.
 
 ## Features
-- OpenAI-compatible REST client (`/chat/completions`) with configurable base URL.
+- OpenAI-compatible REST client (`/v1/chat/completions`) with configurable base URL.
 - Built-in tools: HTTP fetch, workspace filesystem, Python sandbox, deep thinking planner, calculator, regex extract, unit conversion, JSON repair, multi-file code runner.
 - Tool registry and validation pipeline for safe tool creation.
 - CLI and FastAPI server.
@@ -31,7 +31,7 @@ flowchart TD
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .[dev]
+pip install -e '.[dev]'
 ```
 
 ### Run in mock mode (no API key)
@@ -57,7 +57,7 @@ Common flags:
 export OPENAI_API_KEY=sk-your-key
 export OPENAI_BASE_URL=https://api.openai.com/v1
 export OPENAI_MODEL=gpt-4.1-mini
-python -m agentforge "Summarize the weather" --base-url https://api.openai.com/v1
+python -m agentforge "Summarize the weather"
 ```
 
 #### Local OpenAI-compatible servers
