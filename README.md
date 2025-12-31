@@ -4,10 +4,11 @@ AgentForge is a production-ready Python 3.11+ repository that implements an agen
 
 ## Features
 - OpenAI-compatible REST client (`/v1/chat/completions`) with configurable base URL.
-- Built-in tools: HTTP fetch, workspace filesystem, Python sandbox, deep thinking planner, calculator, regex extract, unit conversion, JSON repair, multi-file code runner.
-- Tool registry and validation pipeline for safe tool creation.
-- CLI and FastAPI server.
-- Eval harness with trace/replay support.
+- Runtime layer with workspace-scoped audit logs, metrics, and RBAC policies.
+- Workflow runner with deterministic defaults and versioned specs.
+- Pack management for signed tool/workflow bundles (HMAC default).
+- Built-in tools and connectors: HTTP fetch, workspace filesystem, Python sandbox, calculator, regex extract, unit conversion, JSON repair, multi-file code runner, filesystem/SQL/PDF/email connectors.
+- CLI, FastAPI server, and eval gating for release checks.
 
 ## How the agent works
 ```mermaid
@@ -34,6 +35,12 @@ source .venv/bin/activate
 pip install -e '.[dev]'
 ```
 
+Optional extras:
+```bash
+pip install -e '.[pdf]'
+pip install -e '.[postgres]'
+```
+
 ### Run in mock mode (no API key)
 ```bash
 python -m agentforge "Hello from mock mode"
@@ -47,7 +54,7 @@ python -m agentforge "Draft a release note" --verify --self-consistency 3
 Common flags:
 - `--mode {direct,deep}`: switch between direct and deep planning modes.
 - `--allow-tool-creation`: enable tool creation (also available via `ALLOW_TOOL_CREATION=true`).
-- `--workspace PATH`: override the workspace directory.
+- `--workspace ID`: select a workspace (defaults to `default`).
 - `--max-steps`, `--max-tool-calls`, `--max-model-calls`: bound the agent loop.
 - `--strict-json`, `--code-check`, `--code-check-max-iters`: tighten response formatting and validation.
 - `--max-message-chars`, `--max-turns`: control context budgeting.
@@ -88,7 +95,8 @@ Environment variables (CLI flags override env vars):
 - `OPENAI_FORCE_CHATCOMPLETIONS_PATH` (optional override)
 - `AGENT_MODE` (default `direct`)
 - `ALLOW_TOOL_CREATION` (default `false`)
-- `WORKSPACE_DIR` (default `./workspace`)
+- `AGENTFORGE_HOME` (default `~/.agentforge`)
+- `WORKSPACE_ID` (default `default`)
 - `MAX_TOOL_OUTPUT_CHARS` (default `4000`)
 - `KEEP_RAW_TOOL_OUTPUT` (default `true`)
 - `SUMMARY_LINES` (default `10`)
@@ -105,6 +113,14 @@ Environment variables (CLI flags override env vars):
 - `CODE_CHECK_MAX_ITERS` (default `2`)
 - `SANDBOX_ALLOWED_IMPORTS` (comma-separated allowlist of Python imports)
 - `SANDBOX_PASSTHROUGH_ENV` (comma-separated allowlist of extra env vars)
+- `ALLOW_DESTRUCTIVE_SQL` (default `false`)
+
+Workspace layout (per ID under `AGENTFORGE_HOME/workspaces/<id>`):
+- `workspace.json` (policy, RBAC, model defaults)
+- `audit/` (JSONL audit logs)
+- `metrics/` (JSONL metrics)
+- `packs/` (installed packs)
+- `data/` (connector data root)
 
 Recommended small-model settings:
 ```bash
@@ -140,4 +156,33 @@ pytest
 Run lint:
 ```bash
 ruff check .
+```
+
+## Workflow runner
+Validate and run workflows:
+```bash
+agentforge workflow validate path/to/workflow.json --workspace default
+agentforge workflow run path/to/workflow.json --input '{"x": 2, "y": 3}' --workspace default
+```
+
+## Packs
+Build, sign, and install packs:
+```bash
+agentforge pack build ./my_pack --out my_pack.zip --workspace default
+agentforge pack sign my_pack.zip --workspace default
+agentforge pack verify my_pack.zip --workspace default
+agentforge pack install my_pack.zip --workspace default --allow-unsigned
+```
+
+## Eval gating
+Run eval packs and gate releases:
+```bash
+agentforge eval run --pack sample --report report.json --workspace default
+agentforge release check --baseline report.json --candidate report.json --min-delta 0
+```
+
+## Docker quickstart
+```bash
+docker build -t agentforge:latest .
+docker compose up
 ```

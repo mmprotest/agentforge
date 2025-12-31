@@ -12,6 +12,10 @@ class ToolResult(BaseModel):
     output: Any
 
 
+class ToolError(RuntimeError):
+    """Raised when tool execution fails with a user-facing error."""
+
+
 class Tool(ABC):
     """Abstract tool."""
 

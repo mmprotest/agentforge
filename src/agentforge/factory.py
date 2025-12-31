@@ -23,6 +23,12 @@ from agentforge.tools.builtins.python_sandbox import PythonSandboxTool
 from agentforge.tools.builtins.regex_extract import RegexExtractTool
 from agentforge.tools.builtins.unit_convert import UnitConvertTool
 from agentforge.tools.registry import ToolRegistry
+from agentforge.tools.connectors import (
+    EmailIngestTool,
+    FilesystemConnectorTool,
+    PdfExtractTool,
+    SqlConnectorTool,
+)
 from agentforge.tools.tool_maker import ToolMaker, ToolMakerTool
 
 
@@ -54,6 +60,10 @@ def build_registry(
     }
     registry.register(HttpFetchTool())
     registry.register(FileSystemTool(settings.workspace_dir))
+    registry.register(FilesystemConnectorTool(settings.workspace_dir))
+    registry.register(PdfExtractTool(settings.workspace_dir))
+    registry.register(SqlConnectorTool(settings.workspace_dir, allow_destructive=settings.allow_destructive_sql))
+    registry.register(EmailIngestTool())
     registry.register(PythonSandboxTool(settings.workspace_dir, allowed_imports=allowed_imports))
     registry.register(DeepThinkTool())
     registry.register(CalculatorTool())
@@ -97,6 +107,8 @@ def build_agent(
     self_consistency: int = 1,
     trace: TraceRecorder | None = None,
     memory: MemoryStore | None = None,
+    runtime: Any | None = None,
+    user_role: str = "operator",
     overrides: dict[str, Any] | None = None,
 ) -> Agent:
     policy = build_policy(settings)
@@ -118,5 +130,7 @@ def build_agent(
         trim_strategy=settings.trim_strategy,
         code_check=settings.code_check,
         code_check_max_iters=settings.code_check_max_iters,
+        runtime=runtime,
+        user_role=user_role,
         **(overrides or {}),
     )

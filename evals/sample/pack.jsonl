@@ -1,0 +1,1 @@
+{"id": "agent-sample", "input": "ping", "expected_output": "Mock response to: ping", "mode": "agent", "scoring": "exact"}

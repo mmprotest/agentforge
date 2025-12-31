@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 import json
 import re
 import sys
@@ -38,9 +39,18 @@ from agentforge.tools.registry import ToolRegistry
 from agentforge.util.context_trim import trim_messages
 from agentforge.util.json_repair import JsonRepairError, repair_json
 from agentforge.util.logging import get_logger, redact
+from agentforge.runtime.runtime import Runtime
+from agentforge.runtime.context import RunContext
+from agentforge.runtime.rbac import AuthorizationError, authorize_connector, authorize_tool
 
 
 logger = get_logger(__name__)
+CONNECTOR_TOOLS = {
+    "filesystem_connector",
+    "sql_connector",
+    "pdf_extract_text",
+    "email_imap_ingest",
+}
 @dataclass
 class AgentResult:
     answer: str
@@ -81,6 +91,9 @@ class Agent:
         trim_strategy: str = "drop_oldest",
         code_check: bool = False,
         code_check_max_iters: int = 2,
+        runtime: Runtime | None = None,
+        run_context: RunContext | None = None,
+        user_role: str = "operator",
     ) -> None:
         self.model = model
         self.registry = registry
@@ -99,10 +112,14 @@ class Agent:
         self.trim_strategy = trim_strategy
         self.code_check = code_check
         self.code_check_max_iters = max(1, code_check_max_iters)
+        self.runtime = runtime
+        self.run_context = run_context
+        self.user_role = user_role
         self.tools_used: list[str] = []
         self.tools_created: list[str] = []
         self._model_calls = 0
         self._tool_calls = 0
+        self._schema_violations = 0
         self._pending_tool_call_response = None
         self._pending_model_response = None
         self._mcq_letters: set[str] = set()
@@ -131,8 +148,20 @@ class Agent:
         logger.info("Agent run started (mode=%s, verify=%s).", self.mode, self.verify)
         self._model_calls = 0
         self._tool_calls = 0
+        self._schema_violations = 0
         self._pending_tool_call_response = None
         self._mcq_letters = self._detect_mcq(query)
+        run_context = self.run_context
+        if self.runtime and run_context is None:
+            run_context = self.runtime.new_run_context()
+        self.run_context = run_context
+        if self.runtime and run_context:
+            self.runtime.emit_audit(
+                run_context,
+                "agent_run_start",
+                {"mode": self.mode, "verify": self.verify, "query": query},
+            )
+        start_time = datetime.now(timezone.utc)
         if self.self_consistency > 1:
             candidates: list[AgentResult] = []
             for index in range(self.self_consistency):
@@ -154,6 +183,7 @@ class Agent:
                 best.confidence = verified.confidence
             if self._mcq_letters:
                 best.answer = self._coerce_mcq_answer(best.answer)
+            self._finalize_runtime(run_context, start_time)
             return best
         result = self._run_once(query)
         if self.verify and self._model_calls < self.max_model_calls:
@@ -163,6 +193,7 @@ class Agent:
             result.confidence = verified.confidence
         if self._mcq_letters:
             result.answer = self._coerce_mcq_answer(result.answer)
+        self._finalize_runtime(run_context, start_time)
         return result
 
     def _run_once(self, query: str, nonce: str | None = None) -> AgentResult:
@@ -645,6 +676,27 @@ class Agent:
                 step_summary=f"Requested unknown or disallowed tool: {tool_name}",
                 failure_reason="tool_unavailable",
             )
+        if self.runtime:
+            try:
+                allowlist = self.runtime.workspace.config.policy.get("tool_allowlist")
+                if allowlist is not None and tool_name not in allowlist:
+                    raise AuthorizationError(
+                        f"Tool '{tool_name}' not allowed by workspace policy."
+                    )
+                authorize_tool(self.user_role, tool_name, self.runtime.rbac)
+                if tool_name in CONNECTOR_TOOLS:
+                    authorize_connector(self.user_role, tool_name, self.runtime.rbac)
+            except AuthorizationError as exc:
+                if self.run_context:
+                    self.runtime.emit_audit(
+                        self.run_context,
+                        "tool_denied",
+                        {"tool": tool_name, "reason": str(exc)},
+                    )
+                return StepOutcome(
+                    step_summary=str(exc),
+                    failure_reason="tool_denied",
+                )
         try:
             validated_args = tool.input_schema.model_validate(
                 response.tool_call.arguments
@@ -1132,6 +1184,19 @@ class Agent:
             if tool_created:
                 self.tools_created.append(tool_created)
         entry = self.memory.add_tool_output(tool_name, output)
+        if self.runtime and self.run_context:
+            self.runtime.metrics.inc("tool_calls", 1)
+            if arguments is not None:
+                self.runtime.emit_audit(
+                    self.run_context,
+                    "tool_call",
+                    {"tool": tool_name, "arguments": arguments},
+                )
+            self.runtime.emit_audit(
+                self.run_context,
+                "tool_result",
+                {"tool": tool_name, "summary": entry.summary},
+            )
         payload = {
             "handle": entry.handle,
             "summary": entry.summary,
@@ -1396,11 +1461,36 @@ class Agent:
             ok = not (isinstance(output, dict) and output.get("ok") is False)
             return output, ok, False
         except ValidationError as exc:
+            self._schema_violations += 1
             return self._tool_error_payload(tool, exc, schema_error=True), False, True
         except (ValueError, TypeError, KeyError) as exc:
             return self._tool_error_payload(tool, exc), False, False
         except Exception as exc:  # noqa: BLE001
             return self._tool_error_payload(tool, exc), False, False
+
+    def _finalize_runtime(self, run_context: RunContext | None, start_time: datetime) -> None:
+        if not self.runtime or not run_context:
+            return
+        duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        summary = {
+            "run_id": run_context.run_id,
+            "trace_id": run_context.trace_id,
+            "duration_ms": duration_ms,
+            "model_calls": self._model_calls,
+            "tool_calls": self._tool_calls,
+            "schema_violations": self._schema_violations,
+            "retries": 0,
+        }
+        self.runtime.metrics.counters.update(
+            {
+                "model_calls": self._model_calls,
+                "tool_calls": self._tool_calls,
+                "schema_violations": self._schema_violations,
+            }
+        )
+        self.runtime.metrics.export_json()
+        self.runtime.metrics.write_run_summary(summary)
+        self.runtime.emit_audit(run_context, "agent_run_complete", summary)
 
     def _tool_error_payload(
         self, tool: Tool, exc: Exception, schema_error: bool = False
