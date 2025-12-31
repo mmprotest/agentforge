@@ -16,6 +16,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
+pdf = ["pypdf"]
+postgres = ["psycopg[binary]"]
+yaml = ["pyyaml"]
 
 [project.scripts]
 agentforge = "agentforge.cli:main"

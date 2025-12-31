@@ -1,0 +1,10 @@
+version: "3.9"
+services:
+  agentforge:
+    build: .
+    image: agentforge:latest
+    volumes:
+      - ./data:/data
+    environment:
+      - AGENTFORGE_HOME=/data
+    command: ["--help"]

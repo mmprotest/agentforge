@@ -1,0 +1,11 @@
+image:
+  repository: agentforge
+  tag: latest
+  pullPolicy: IfNotPresent
+
+env:
+  AGENTFORGE_HOME: /data
+
+persistence:
+  enabled: true
+  size: 1Gi

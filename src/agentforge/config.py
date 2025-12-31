@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     allow_tool_creation: bool = Field(
         default=False, validation_alias="ALLOW_TOOL_CREATION"
     )
+    agentforge_home: str = Field(
+        default="~/.agentforge", validation_alias="AGENTFORGE_HOME"
+    )
+    workspace_id: str = Field(default="default", validation_alias="WORKSPACE_ID")
     workspace_dir: str = Field(default="./workspace", validation_alias="WORKSPACE_DIR")
     max_tool_output_chars: int = Field(
         default=4000, validation_alias="MAX_TOOL_OUTPUT_CHARS"
@@ -78,6 +82,9 @@ class Settings(BaseSettings):
     )
     sandbox_passthrough_env: str | None = Field(
         default=None, validation_alias="SANDBOX_PASSTHROUGH_ENV"
+    )
+    allow_destructive_sql: bool = Field(
+        default=False, validation_alias="ALLOW_DESTRUCTIVE_SQL"
     )
 
 
