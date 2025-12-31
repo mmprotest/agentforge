@@ -186,20 +186,41 @@ def _rewrite_zip_manifest(zip_path: Path, manifest: dict[str, Any]) -> None:
     temp_path.rename(zip_path)
 
 
+def format_schema_error(error: Any) -> str:
+    path = "/".join(str(part) for part in error.path) or "<root>"
+    message = str(getattr(error, "message", ""))
+    max_len = 500
+    if len(message) > max_len:
+        message = f"{message[:max_len]}..."
+    validator = getattr(error, "validator", None)
+    schema_path = getattr(error, "schema_path", None)
+    details: list[str] = []
+    if validator:
+        details.append(f"validator={validator}")
+    if schema_path:
+        details.append(f"schema_path={'/'.join(str(part) for part in schema_path)}")
+    suffix = f" ({', '.join(details)})" if details else ""
+    return f"{path}: {message}{suffix}"
+
+
 def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if importlib.util.find_spec("jsonschema") is not None:
-        if not SCHEMA_PATH.exists():
-            return [f"schema file not found: {SCHEMA_PATH}"]
-        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
-        jsonschema = importlib.import_module("jsonschema")
-        validator_cls = jsonschema.validators.validator_for(schema)
-        validator_cls.check_schema(schema)
-        validator = validator_cls(schema)
-        for error in sorted(validator.iter_errors(manifest), key=lambda err: list(err.path)):
-            path = "/".join(str(part) for part in error.path) or "<root>"
-            errors.append(f"{path}: {error.message}")
-        return errors
+        try:
+            if not SCHEMA_PATH.exists():
+                return [f"schema file not found: {SCHEMA_PATH}"]
+            schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+            jsonschema = importlib.import_module("jsonschema")
+            validator_cls = jsonschema.validators.validator_for(schema)
+            validator_cls.check_schema(schema)
+            validator = validator_cls(schema)
+            for error in sorted(
+                validator.iter_errors(manifest), key=lambda err: list(err.path)
+            ):
+                errors.append(format_schema_error(error))
+            return errors
+        except Exception as exc:  # noqa: BLE001
+            return [f"schema_validation_error: {exc.__class__.__name__}: {exc}"]
 
     print("Install agentforge[schema] for full schema validation.", file=sys.stderr)
     if manifest.get("spec_version") != SPEC_VERSION:
