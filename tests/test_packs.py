@@ -3,10 +3,13 @@ from pathlib import Path
 import json
 import zipfile
 
+import pytest
+
 from agentforge.packs.manager import (
     build_pack,
     install_pack,
     sign_pack,
+    validate_manifest_schema,
     validate_pack,
     verify_pack,
 )
@@ -182,3 +185,18 @@ def test_pack_install_blocks_zip_slip(tmp_path: Path) -> None:
         assert "Unsafe path" in str(exc) or "Path traversal" in str(exc)
     else:
         raise AssertionError("Zip Slip not blocked")
+
+
+def test_manifest_schema_validation_uses_jsonschema_when_available() -> None:
+    pytest.importorskip("jsonschema")
+    manifest = {
+        "name": "demo",
+        "version": "1.0.0",
+        "created_at": "2024-01-01T00:00:00Z",
+        "publisher": "test",
+        "type": "tool_pack",
+        "entrypoints": [],
+        "files": [],
+    }
+    errors = validate_manifest_schema(manifest)
+    assert any("spec_version" in error for error in errors)
