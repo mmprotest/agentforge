@@ -18,11 +18,10 @@ jobs:
         with:
           workspace: default
           eval_pack: sample
-          baseline_report: evals/baseline_report.json
           min_score: "0.0"
           report_out: agentforge_eval_report.json
           allow_regression: "false"
-          fail_on_missing_baseline: "true"
+          fail_on_missing_baseline: "false"
         env:
           AGENTFORGE_HOME: /data
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}

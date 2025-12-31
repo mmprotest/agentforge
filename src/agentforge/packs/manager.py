@@ -5,9 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
+import importlib
+import importlib.util
 import json
 from pathlib import Path
 from posixpath import normpath
+import sys
 import zipfile
 from typing import Any
 
@@ -15,6 +18,7 @@ from agentforge.packs.signing import sign_manifest, verify_manifest
 
 SPEC_VERSION = "0.1"
 ALLOWED_TYPES = {"workflow_pack", "tool_pack", "mixed"}
+SCHEMA_PATH = Path(__file__).resolve().parents[3] / "schemas/agent_pack_manifest_v0.1.schema.json"
 
 
 @dataclass
@@ -184,9 +188,30 @@ def _rewrite_zip_manifest(zip_path: Path, manifest: dict[str, Any]) -> None:
 
 def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
     errors: list[str] = []
+    if importlib.util.find_spec("jsonschema") is not None:
+        if not SCHEMA_PATH.exists():
+            return [f"schema file not found: {SCHEMA_PATH}"]
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        jsonschema = importlib.import_module("jsonschema")
+        validator = jsonschema.Draft2020Validator(schema)
+        for error in sorted(validator.iter_errors(manifest), key=lambda err: list(err.path)):
+            path = ".".join(str(part) for part in error.path) or "manifest"
+            errors.append(f"{path}: {error.message}")
+        return errors
+
+    print("Install agentforge[schema] for full schema validation.", file=sys.stderr)
     if manifest.get("spec_version") != SPEC_VERSION:
         errors.append("spec_version must be 0.1")
-    for field in ("name", "version", "created_at", "publisher", "type", "files", "entrypoints"):
+    for field in (
+        "spec_version",
+        "name",
+        "version",
+        "created_at",
+        "publisher",
+        "type",
+        "files",
+        "entrypoints",
+    ):
         if field not in manifest:
             errors.append(f"missing required field: {field}")
     if manifest.get("type") and manifest.get("type") not in ALLOWED_TYPES:
@@ -213,6 +238,7 @@ def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
 def validate_pack(path: Path, key: str | None = None) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
+    schema_available = importlib.util.find_spec("jsonschema") is not None
     if path.is_dir():
         manifest_path = path / "manifest.json"
         if not manifest_path.exists():
@@ -233,6 +259,8 @@ def validate_pack(path: Path, key: str | None = None) -> dict[str, Any]:
         errors.extend(validate_manifest_schema(manifest))
         if not verify_pack_files(path, manifest):
             errors.append("pack file hash verification failed")
+    if not schema_available:
+        warnings.append("Install agentforge[schema] for full schema validation.")
     signature = manifest.get("signature")
     if signature and key:
         if not verify_manifest(manifest, key):

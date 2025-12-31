@@ -28,6 +28,8 @@ def _ensure_agentforge_installed() -> None:
         [sys.executable, "-m", "pip", "install", "-e", "/github/workspace"],
         check=True,
     )
+    if shutil.which("agentforge") is None:
+        raise SystemExit("agentforge binary not found after install")
 
 
 def _resolve_workspace_path(path_value: str, workspace_root: Path) -> Path:
@@ -79,6 +81,25 @@ def _top_failing_cases(candidate: dict[str, Any], limit: int = 10) -> list[str]:
     return failing[:limit]
 
 
+def _build_eval_command(
+    workspace_id: str,
+    pack_name: str,
+    report_path: Path,
+    agentforge_args: list[str],
+) -> list[str]:
+    return [
+        "agentforge",
+        "--workspace",
+        workspace_id,
+        "eval",
+        "run",
+        "--pack",
+        pack_name,
+        "--report",
+        str(report_path),
+    ] + agentforge_args
+
+
 def main() -> None:
     workspace_root = Path(os.getenv("GITHUB_WORKSPACE", "/github/workspace"))
     summary_path = Path(os.getenv("GITHUB_STEP_SUMMARY", "/tmp/summary.txt"))
@@ -110,17 +131,12 @@ def main() -> None:
     pack_name = _resolve_pack_name(
         eval_pack_input, workspace_root, agentforge_home, workspace_id
     )
-    command = [
-        "agentforge",
-        "eval",
-        "run",
-        "--pack",
-        pack_name,
-        "--workspace",
-        workspace_id,
-        "--report",
-        str(report_path),
-    ] + agentforge_args
+    command = _build_eval_command(
+        workspace_id=workspace_id,
+        pack_name=pack_name,
+        report_path=report_path,
+        agentforge_args=agentforge_args,
+    )
 
     result = subprocess.run(command)
     if result.returncode != 0:
@@ -155,12 +171,12 @@ def main() -> None:
             )
 
     candidate_score = float(candidate.get("overall_score", 0.0))
-    baseline_display = "n/a" if baseline_score is None else f\"{baseline_score:.4f}\"
-    delta_display = "n/a" if delta is None else f\"{delta:.4f}\"
+    baseline_display = "n/a" if baseline_score is None else f"{baseline_score:.4f}"
+    delta_display = "n/a" if delta is None else f"{delta:.4f}"
     outcome = "PASS" if gate_pass else "FAIL"
 
     print(
-        f\"AI Regression Gate: {outcome} | candidate={candidate_score:.4f} | baseline={baseline_display} | delta={delta_display}\"
+        f"AI Regression Gate: {outcome} | candidate={candidate_score:.4f} | baseline={baseline_display} | delta={delta_display}"
     )
     for message in messages:
         print(message)
@@ -171,12 +187,12 @@ def main() -> None:
         "",
         "| Metric | Value |",
         "| --- | --- |",
-        f\"| Candidate score | {candidate_score:.4f} |\",
-        f\"| Baseline score | {baseline_display} |\",
-        f\"| Delta | {delta_display} |\",
-        f\"| Min score | {min_score:.4f} |\",
-        f\"| Mode | {mode} |\",
-        f\"| Result | {outcome} |\",
+        f"| Candidate score | {candidate_score:.4f} |",
+        f"| Baseline score | {baseline_display} |",
+        f"| Delta | {delta_display} |",
+        f"| Min score | {min_score:.4f} |",
+        f"| Mode | {mode} |",
+        f"| Result | {outcome} |",
         "",
     ]
     if failing_cases:
@@ -185,7 +201,7 @@ def main() -> None:
         summary_lines.append("")
     if messages:
         summary_lines.append("### Messages")
-        summary_lines.extend([f\"- {message}\" for message in messages])
+        summary_lines.extend([f"- {message}" for message in messages])
         summary_lines.append("")
     _write_summary(summary_path, summary_lines)
 

@@ -1,3 +1,4 @@
+from importlib.util import find_spec
 from pathlib import Path
 import json
 import zipfile
@@ -135,10 +136,21 @@ def test_pack_build_manifest_hashes(tmp_path: Path) -> None:
 def test_pack_validate_schema_missing_fields(tmp_path: Path) -> None:
     pack_dir = tmp_path / "pack"
     pack_dir.mkdir()
-    (pack_dir / "manifest.json").write_text(json.dumps({"name": "demo"}), encoding="utf-8")
+    (pack_dir / "manifest.json").write_text(
+        json.dumps({"name": "demo", "files": {}}), encoding="utf-8"
+    )
     result = validate_pack(pack_dir)
     assert result["ok"] is False
-    assert any("missing required field" in error for error in result["errors"])
+    if find_spec("jsonschema") is not None:
+        assert any("required property" in error for error in result["errors"])
+        assert any("files" in error for error in result["errors"])
+    else:
+        assert any("missing required field: spec_version" in error for error in result["errors"])
+        assert any("files must be a list" in error for error in result["errors"])
+        assert any(
+            "Install agentforge[schema] for full schema validation." in warning
+            for warning in result["warnings"]
+        )
 
 
 def test_pack_install_blocks_zip_slip(tmp_path: Path) -> None:

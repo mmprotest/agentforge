@@ -161,17 +161,21 @@ ruff check .
 ## Workflow runner
 Validate and run workflows:
 ```bash
-agentforge workflow validate path/to/workflow.json --workspace default
-agentforge workflow run path/to/workflow.json --input '{"x": 2, "y": 3}' --workspace default
+agentforge --workspace default workflow validate path/to/workflow.json
+agentforge --workspace default workflow run path/to/workflow.json --input '{"x": 2, "y": 3}'
 ```
 
 ## Packs
 Build, sign, and install packs:
 ```bash
-agentforge pack build ./my_pack --out my_pack.zip --workspace default
-agentforge pack sign my_pack.zip --workspace default
-agentforge pack validate my_pack.zip --workspace default
-agentforge pack install my_pack.zip --workspace default --allow-unsigned
+agentforge --workspace default pack build ./my_pack --out my_pack.zip
+agentforge --workspace default pack sign my_pack.zip
+agentforge --workspace default pack validate my_pack.zip
+agentforge --workspace default pack install my_pack.zip --allow-unsigned
+```
+For full schema validation during `pack validate`, install the optional extra:
+```bash
+pip install "agentforge[schema]"
 ```
 
 ## Agent Pack Spec v0.1
@@ -179,16 +183,16 @@ AgentForge publishes a public pack format specification in `docs/agent-pack-spec
 
 Quick flow:
 ```bash
-agentforge pack build ./my_pack --out my_pack.zip --workspace default
-agentforge pack sign my_pack.zip --workspace default
-agentforge pack validate my_pack.zip --workspace default
-agentforge pack install my_pack.zip --workspace default --allow-unsigned
+agentforge --workspace default pack build ./my_pack --out my_pack.zip
+agentforge --workspace default pack sign my_pack.zip
+agentforge --workspace default pack validate my_pack.zip
+agentforge --workspace default pack install my_pack.zip --allow-unsigned
 ```
 
 ## Eval gating
 Run eval packs and gate releases:
 ```bash
-agentforge eval run --pack sample --report report.json --workspace default
+agentforge --workspace default eval run --pack sample --report report.json
 agentforge release check --baseline report.json --candidate report.json --min-delta 0
 ```
 
