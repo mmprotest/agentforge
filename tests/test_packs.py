@@ -200,3 +200,49 @@ def test_manifest_schema_validation_uses_jsonschema_when_available() -> None:
     }
     errors = validate_manifest_schema(manifest)
     assert any("spec_version" in error for error in errors)
+
+
+def test_pack_validate_schema_error_does_not_include_instance_values() -> None:
+    pytest.importorskip("jsonschema")
+    manifest = {
+        "name": "demo",
+        "version": "1.0.0",
+        "created_at": "2024-01-01T00:00:00Z",
+        "publisher": "SUPER_SECRET_PUBLISHER",
+        "type": "tool_pack",
+        "entrypoints": [],
+        "files": [],
+    }
+    errors = validate_manifest_schema(manifest)
+    assert errors
+    assert all("SUPER_SECRET_PUBLISHER" not in error for error in errors)
+
+
+def test_pack_validate_schema_exception_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    jsonschema = pytest.importorskip("jsonschema")
+
+    class DummyValidator:
+        def __init__(self, schema: dict) -> None:
+            self.schema = schema
+
+        @classmethod
+        def check_schema(cls, schema: dict) -> None:
+            return None
+
+        def iter_errors(self, instance: dict) -> list:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(jsonschema.validators, "validator_for", lambda schema: DummyValidator)
+    manifest = {
+        "spec_version": "0.1",
+        "name": "demo",
+        "version": "1.0.0",
+        "created_at": "2024-01-01T00:00:00Z",
+        "publisher": "test",
+        "type": "tool_pack",
+        "entrypoints": [],
+        "files": [],
+    }
+    errors = validate_manifest_schema(manifest)
+    assert errors
+    assert any("schema_validation_error" in error for error in errors)
