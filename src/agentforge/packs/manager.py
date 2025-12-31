@@ -193,9 +193,11 @@ def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
             return [f"schema file not found: {SCHEMA_PATH}"]
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
         jsonschema = importlib.import_module("jsonschema")
-        validator = jsonschema.Draft2020Validator(schema)
+        validator_cls = jsonschema.validators.validator_for(schema)
+        validator_cls.check_schema(schema)
+        validator = validator_cls(schema)
         for error in sorted(validator.iter_errors(manifest), key=lambda err: list(err.path)):
-            path = ".".join(str(part) for part in error.path) or "manifest"
+            path = "/".join(str(part) for part in error.path) or "<root>"
             errors.append(f"{path}: {error.message}")
         return errors
 
