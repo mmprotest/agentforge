@@ -12,7 +12,13 @@ from agentforge.config import Settings
 from agentforge.evals.release import ReleaseCheckError, release_check
 from agentforge.evals.runner import run_eval_pack
 from agentforge.factory import build_agent, build_model, build_registry
-from agentforge.packs.manager import build_pack, install_pack, sign_pack, verify_pack
+from agentforge.packs.manager import (
+    build_pack,
+    install_pack,
+    sign_pack,
+    validate_pack,
+    verify_pack,
+)
 from agentforge.runtime.runtime import Runtime
 from agentforge.runtime.workspaces import ensure_workspace, load_workspace
 from agentforge.runtime.smoke import run_smoke_test
@@ -86,6 +92,8 @@ def parse_subcommand(args: list[str]) -> argparse.Namespace:
     pack_build.add_argument("--out", required=True)
     pack_sign = pack_sub.add_parser("sign")
     pack_sign.add_argument("pack")
+    pack_validate = pack_sub.add_parser("validate")
+    pack_validate.add_argument("pack")
     pack_verify = pack_sub.add_parser("verify")
     pack_verify.add_argument("pack")
     pack_install = pack_sub.add_parser("install")
@@ -267,6 +275,14 @@ def _handle_subcommand(args: argparse.Namespace) -> None:
                 raise SystemExit("Missing PACK_SIGNING_KEY in workspace secrets")
             manifest = sign_pack(Path(args.pack), key)
             print(json.dumps(manifest, indent=2))
+            return
+        if args.pack_command == "validate":
+            result = validate_pack(Path(args.pack), key=key)
+            for warning in result["warnings"]:
+                print(f"warning: {warning}")
+            if not result["ok"]:
+                raise SystemExit("\n".join(result["errors"]))
+            print("ok")
             return
         if args.pack_command == "verify":
             if not key:

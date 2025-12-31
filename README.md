@@ -170,7 +170,18 @@ Build, sign, and install packs:
 ```bash
 agentforge pack build ./my_pack --out my_pack.zip --workspace default
 agentforge pack sign my_pack.zip --workspace default
-agentforge pack verify my_pack.zip --workspace default
+agentforge pack validate my_pack.zip --workspace default
+agentforge pack install my_pack.zip --workspace default --allow-unsigned
+```
+
+## Agent Pack Spec v0.1
+AgentForge publishes a public pack format specification in `docs/agent-pack-spec-v0.1.md`.
+
+Quick flow:
+```bash
+agentforge pack build ./my_pack --out my_pack.zip --workspace default
+agentforge pack sign my_pack.zip --workspace default
+agentforge pack validate my_pack.zip --workspace default
 agentforge pack install my_pack.zip --workspace default --allow-unsigned
 ```
 
