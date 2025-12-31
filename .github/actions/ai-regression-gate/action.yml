@@ -1,0 +1,40 @@
+name: "AI Regression Gate"
+description: "Run AgentForge eval packs and gate regressions."
+inputs:
+  workspace:
+    description: "AgentForge workspace id"
+    required: false
+    default: "default"
+  eval_pack:
+    description: "Eval pack name or path"
+    required: true
+  baseline_report:
+    description: "Path to baseline report JSON"
+    required: false
+  min_score:
+    description: "Minimum allowed overall score"
+    required: false
+    default: "0.0"
+  allow_regression:
+    description: "Allow candidate score to be lower than baseline"
+    required: false
+    default: "false"
+  report_out:
+    description: "Path to write candidate report"
+    required: false
+    default: "agentforge_eval_report.json"
+  agentforge_args:
+    description: "Extra arguments passed to agentforge"
+    required: false
+    default: ""
+  mode:
+    description: "agent | workflow | auto"
+    required: false
+    default: "auto"
+  fail_on_missing_baseline:
+    description: "Fail if baseline report is missing"
+    required: false
+    default: "true"
+runs:
+  using: "docker"
+  image: "Dockerfile"

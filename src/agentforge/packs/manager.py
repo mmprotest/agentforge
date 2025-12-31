@@ -7,25 +7,31 @@ from datetime import datetime, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
+from posixpath import normpath
 import zipfile
 from typing import Any
 
 from agentforge.packs.signing import sign_manifest, verify_manifest
 
+SPEC_VERSION = "0.1"
+ALLOWED_TYPES = {"workflow_pack", "tool_pack", "mixed"}
+
 
 @dataclass
 class PackManifest:
+    spec_version: str
     name: str
     version: str
     pack_type: str
     created_at: str
     publisher: str
-    entrypoints: dict[str, Any]
+    entrypoints: list[str]
     files: list[dict[str, str]]
     signature: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = {
+            "spec_version": self.spec_version,
             "name": self.name,
             "version": self.version,
             "type": self.pack_type,
@@ -55,13 +61,15 @@ def build_manifest(source_dir: Path) -> PackManifest:
         version = payload.get("version") or "0.0.0"
         pack_type = payload.get("type") or "mixed"
         publisher = payload.get("publisher") or "unknown"
-        entrypoints = payload.get("entrypoints") or {}
+        entrypoints = payload.get("entrypoints") or []
     else:
         name = source_dir.name
         version = "0.0.0"
         pack_type = "mixed"
         publisher = "unknown"
-        entrypoints = {}
+        entrypoints = []
+    if isinstance(entrypoints, dict):
+        entrypoints = list(entrypoints.values())
     files: list[dict[str, str]] = []
     for path in source_dir.rglob("*"):
         if path.is_dir():
@@ -70,7 +78,9 @@ def build_manifest(source_dir: Path) -> PackManifest:
         if relative == "manifest.json":
             continue
         files.append({"path": relative, "sha256": _hash_file(path)})
+    files.sort(key=lambda item: item["path"])
     return PackManifest(
+        spec_version=SPEC_VERSION,
         name=name,
         version=version,
         pack_type=pack_type,
@@ -97,10 +107,16 @@ def read_manifest_from_zip(zip_path: Path) -> dict[str, Any]:
             return json.loads(handle.read().decode("utf-8"))
 
 
-def sign_pack(zip_path: Path, key: str) -> dict[str, Any]:
-    manifest = read_manifest_from_zip(zip_path)
+def sign_pack(pack_path: Path, key: str) -> dict[str, Any]:
+    if pack_path.is_dir():
+        manifest_path = pack_path / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["signature"] = sign_manifest(manifest, key)
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        return manifest
+    manifest = read_manifest_from_zip(pack_path)
     manifest["signature"] = sign_manifest(manifest, key)
-    _rewrite_zip_manifest(zip_path, manifest)
+    _rewrite_zip_manifest(pack_path, manifest)
     return manifest
 
 
@@ -130,6 +146,9 @@ def install_pack(
     key: str | None = None,
 ) -> Path:
     manifest = read_manifest_from_zip(zip_path)
+    errors = validate_manifest_schema(manifest)
+    if errors:
+        raise RuntimeError("Manifest schema validation failed: " + "; ".join(errors))
     signature = manifest.get("signature")
     if signature and key:
         if not verify_manifest(manifest, key):
@@ -143,7 +162,7 @@ def install_pack(
     pack_dir = dest_root / manifest["name"] / manifest["version"]
     pack_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as archive:
-        archive.extractall(pack_dir)
+        safe_extract(archive, pack_dir)
     return pack_dir
 
 
@@ -161,3 +180,90 @@ def _rewrite_zip_manifest(zip_path: Path, manifest: dict[str, Any]) -> None:
         )
     zip_path.unlink()
     temp_path.rename(zip_path)
+
+
+def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if manifest.get("spec_version") != SPEC_VERSION:
+        errors.append("spec_version must be 0.1")
+    for field in ("name", "version", "created_at", "publisher", "type", "files", "entrypoints"):
+        if field not in manifest:
+            errors.append(f"missing required field: {field}")
+    if manifest.get("type") and manifest.get("type") not in ALLOWED_TYPES:
+        errors.append("type must be workflow_pack, tool_pack, or mixed")
+    if "files" in manifest and not isinstance(manifest.get("files"), list):
+        errors.append("files must be a list")
+    if "entrypoints" in manifest and not isinstance(manifest.get("entrypoints"), list):
+        errors.append("entrypoints must be a list")
+    for entry in manifest.get("files", []):
+        if not isinstance(entry, dict):
+            errors.append("files entries must be objects")
+            continue
+        path = entry.get("path")
+        digest = entry.get("sha256")
+        if not isinstance(path, str):
+            errors.append("file path must be a string")
+        elif not _is_safe_relative_path(path):
+            errors.append(f"file path is not safe: {path}")
+        if not isinstance(digest, str) or len(digest) != 64:
+            errors.append(f"invalid sha256 for {path}")
+    return errors
+
+
+def validate_pack(path: Path, key: str | None = None) -> dict[str, Any]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    if path.is_dir():
+        manifest_path = path / "manifest.json"
+        if not manifest_path.exists():
+            return {"ok": False, "errors": ["manifest.json not found"], "warnings": []}
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        errors.extend(validate_manifest_schema(manifest))
+        for entry in manifest.get("files", []):
+            file_path = path / entry["path"]
+            if not file_path.exists():
+                errors.append(f"missing file: {entry['path']}")
+                continue
+            if _hash_file(file_path) != entry["sha256"]:
+                errors.append(f"hash mismatch for {entry['path']}")
+    else:
+        if not path.exists():
+            return {"ok": False, "errors": ["pack not found"], "warnings": []}
+        manifest = read_manifest_from_zip(path)
+        errors.extend(validate_manifest_schema(manifest))
+        if not verify_pack_files(path, manifest):
+            errors.append("pack file hash verification failed")
+    signature = manifest.get("signature")
+    if signature and key:
+        if not verify_manifest(manifest, key):
+            errors.append("signature verification failed")
+    elif signature and not key:
+        warnings.append("signature present but PACK_SIGNING_KEY not provided")
+    return {"ok": not errors, "errors": errors, "warnings": warnings}
+
+
+def safe_extract(archive: zipfile.ZipFile, dest: Path) -> None:
+    dest_resolved = dest.resolve()
+    for info in archive.infolist():
+        path = info.filename
+        if not _is_safe_relative_path(path):
+            raise RuntimeError(f"Unsafe path in zip: {path}")
+        normalized = Path(normpath(path))
+        target_path = (dest / normalized).resolve()
+        if dest_resolved not in target_path.parents and dest_resolved != target_path:
+            raise RuntimeError(f"Path traversal blocked: {path}")
+        if info.is_dir():
+            target_path.mkdir(parents=True, exist_ok=True)
+            continue
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open(info) as source, target_path.open("wb") as target:
+            target.write(source.read())
+
+
+def _is_safe_relative_path(path: str) -> bool:
+    if path.startswith(("/", "\\")) or ":" in path:
+        return False
+    parts = Path(path).parts
+    if any(part == ".." for part in parts):
+        return False
+    return True

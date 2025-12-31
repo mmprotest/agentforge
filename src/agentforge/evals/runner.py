@@ -78,6 +78,7 @@ def run_eval_pack(
         )
     overall = total / max(1, len(results))
     report = {
+        "report_version": "0.1",
         "overall_score": overall,
         "cases": [
             {
