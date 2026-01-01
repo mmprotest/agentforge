@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import shlex
+import shutil
 import sys
 import tempfile
 import urllib.error
@@ -166,6 +167,65 @@ def _baseline_missing_message() -> str:
     )
 
 
+def _baseline_artifact_not_found_message(artifact_name: str) -> str:
+    return (
+        f"Baseline artifact not found: {artifact_name}. Run the baseline workflow on main first "
+        f"({BASELINE_WORKFLOW_FILE})."
+    )
+
+
+def _baseline_missing_file_message(expected_relpath: str) -> str:
+    return (
+        f"Baseline artifact missing expected file: {expected_relpath}. Ensure ai-baseline.yml "
+        "uploads exactly this path."
+    )
+
+
+def _normalize_expected_relpath(expected_relpath: str) -> str:
+    if not expected_relpath:
+        raise BaselineError("Baseline artifact path must be a relative path.")
+    normalized = expected_relpath.replace("\\", "/")
+    if Path(normalized).is_absolute() or PureWindowsPath(normalized).is_absolute():
+        raise BaselineError(
+            f"Baseline artifact path must be relative, not absolute: {expected_relpath}."
+        )
+    if PureWindowsPath(normalized).drive:
+        raise BaselineError(
+            f"Baseline artifact path must be relative, not a drive path: {expected_relpath}."
+        )
+    path = Path(normalized)
+    if ".." in path.parts:
+        raise BaselineError(
+            f"Baseline artifact extraction blocked: path traversal detected for {expected_relpath}."
+        )
+    return path.as_posix()
+
+
+def extract_single_file_from_zip(
+    zip_path: Path, expected_relpath: str, out_dir: Path
+) -> Path:
+    normalized = _normalize_expected_relpath(expected_relpath)
+    with zipfile.ZipFile(zip_path) as handle:
+        try:
+            info = handle.getinfo(normalized)
+        except KeyError as exc:
+            raise BaselineError(_baseline_missing_file_message(expected_relpath)) from exc
+        if info.is_dir():
+            raise BaselineError(_baseline_missing_file_message(expected_relpath))
+        target_path = (out_dir / normalized).resolve()
+        out_dir_resolved = out_dir.resolve()
+        try:
+            target_path.relative_to(out_dir_resolved)
+        except ValueError as exc:
+            raise BaselineError(
+                "Baseline artifact extraction blocked: path traversal detected."
+            ) from exc
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with handle.open(info) as source, target_path.open("wb") as destination:
+            shutil.copyfileobj(source, destination)
+    return target_path
+
+
 def _download_artifact_zip(url: str, token: str, destination: Path) -> None:
     request = urllib.request.Request(
         url,
@@ -190,7 +250,7 @@ def _resolve_baseline_from_artifact(
     try:
         repo_data = _github_api_request(f"{api_root}/repos/{repo}", token)
     except urllib.error.URLError as exc:
-        raise BaselineError(f"Baseline artifact fetch failed: {exc}") from exc
+        raise BaselineError(f"GitHub API request failed: {exc}") from exc
     default_branch = repo_data.get("default_branch", "main")
     try:
         workflow_runs = _github_api_request(
@@ -199,20 +259,20 @@ def _resolve_baseline_from_artifact(
             token,
         )
     except urllib.error.URLError as exc:
-        raise BaselineError(f"Baseline artifact fetch failed: {exc}") from exc
+        raise BaselineError(f"GitHub API request failed: {exc}") from exc
     runs = workflow_runs.get("workflow_runs", [])
     if not runs:
-        raise BaselineError(_baseline_missing_message())
+        raise BaselineError(_baseline_artifact_not_found_message(artifact_name))
     run_id = runs[0]["id"]
     try:
         artifacts = _github_api_request(
             f"{api_root}/repos/{repo}/actions/runs/{run_id}/artifacts", token
         ).get("artifacts", [])
     except urllib.error.URLError as exc:
-        raise BaselineError(f"Baseline artifact fetch failed: {exc}") from exc
+        raise BaselineError(f"GitHub API request failed: {exc}") from exc
     match = next((item for item in artifacts if item.get("name") == artifact_name), None)
     if not match:
-        raise BaselineError(_baseline_missing_message())
+        raise BaselineError(_baseline_artifact_not_found_message(artifact_name))
     with tempfile.TemporaryDirectory() as tmp_dir:
         zip_path = Path(tmp_dir) / "artifact.zip"
         try:
@@ -220,22 +280,15 @@ def _resolve_baseline_from_artifact(
                 f"{api_root}/repos/{repo}/actions/artifacts/{match['id']}/zip", token, zip_path
             )
         except urllib.error.URLError as exc:
-            raise BaselineError(f"Baseline artifact fetch failed: {exc}") from exc
+            raise BaselineError(f"GitHub API request failed: {exc}") from exc
         extract_dir = Path(tmp_dir) / "extracted"
         extract_dir.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path) as handle:
-            handle.extractall(extract_dir)
-        desired = extract_dir / artifact_path
-        if desired.exists():
-            artifact_path.parent.mkdir(parents=True, exist_ok=True)
-            artifact_path.write_bytes(desired.read_bytes())
-            return artifact_path
-        fallback = next(extract_dir.rglob(artifact_path.name), None)
-        if fallback and fallback.exists():
-            artifact_path.parent.mkdir(parents=True, exist_ok=True)
-            artifact_path.write_bytes(fallback.read_bytes())
-            return artifact_path
-    raise BaselineError(_baseline_missing_message())
+        extracted = extract_single_file_from_zip(
+            zip_path, artifact_path.as_posix(), extract_dir
+        )
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(extracted.read_bytes())
+        return artifact_path
 
 
 def _prepare_baseline(strategy: str, artifact_name: str, artifact_path: str) -> Path:
