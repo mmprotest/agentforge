@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -47,13 +49,16 @@ def run_eval_pack(
     agent: Agent,
     workflow_engine: WorkflowEngine,
     report_path: Path,
+    default_mode: str | None = None,
 ) -> dict[str, Any]:
     cases = load_eval_pack(pack_path)
     results: list[EvalCaseResult] = []
     total = 0.0
     for case in cases:
         case_id = case.get("id", "case")
-        mode = case.get("mode", "agent")
+        mode = case.get("mode")
+        if mode in (None, "auto"):
+            mode = default_mode or "agent"
         scoring = case.get("scoring", "exact")
         expected = case.get("expected_output")
         actual: Any = None
@@ -77,9 +82,25 @@ def run_eval_pack(
             )
         )
     overall = total / max(1, len(results))
+    passed_cases = len([result for result in results if result.passed])
+    failures = [
+        {"id": result.case_id, "reason": "Score below threshold"}
+        for result in results
+        if not result.passed
+    ]
+    eval_pack_id = pack_path.parent.name
+    generated_at = datetime.now(timezone.utc).isoformat()
+    git_sha = os.environ.get("GITHUB_SHA")
     report = {
         "report_version": "0.1",
+        "generated_at": generated_at,
+        "git_sha": git_sha,
+        "eval_pack_id": eval_pack_id,
+        "eval_pack_name": eval_pack_id,
         "overall_score": overall,
+        "total_cases": len(results),
+        "passed_cases": passed_cases,
+        "failures": failures,
         "cases": [
             {
                 "id": result.case_id,

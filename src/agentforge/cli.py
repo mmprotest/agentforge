@@ -29,6 +29,7 @@ SUBCOMMANDS = {
     "workflow",
     "pack",
     "eval",
+    "gate",
     "release",
     "workspace",
     "metrics",
@@ -105,6 +106,15 @@ def parse_subcommand(args: list[str]) -> argparse.Namespace:
     eval_run = eval_sub.add_parser("run")
     eval_run.add_argument("--pack", required=True)
     eval_run.add_argument("--report", required=True)
+
+    gate_cmd = subparsers.add_parser("gate")
+    gate_sub = gate_cmd.add_subparsers(dest="gate_command", required=True)
+    gate_run = gate_sub.add_parser("run")
+    gate_run.add_argument("--pack", required=True)
+    gate_run.add_argument("--baseline", required=True)
+    gate_run.add_argument("--report", required=True)
+    gate_run.add_argument("--min-score", type=float, default=0.0)
+    gate_run.add_argument("--allow-regression", action="store_true")
 
     release = subparsers.add_parser("release")
     release_sub = release.add_subparsers(dest="release_command", required=True)
@@ -304,7 +314,7 @@ def _handle_subcommand(args: argparse.Namespace) -> None:
             return
 
     if args.command == "eval":
-        model = build_model(settings, use_mock=True)
+        model = build_model(settings)
         registry = build_registry(settings, model)
         agent = build_agent(settings, model, registry, runtime=runtime)
         engine = WorkflowEngine(model, registry, runtime=runtime)
@@ -317,6 +327,45 @@ def _handle_subcommand(args: argparse.Namespace) -> None:
             {"pack": args.pack, "score": report.get("overall_score")},
         )
         print(json.dumps(report, indent=2))
+        return
+
+    if args.command == "gate":
+        from agentforge.evals.gating import compare, decide_pass, extract_score, load_report
+        from agentforge.evals.summary import build_summary, render_summary
+
+        model = build_model(settings, use_mock=True)
+        registry = build_registry(settings, model)
+        agent = build_agent(settings, model, registry, runtime=runtime)
+        engine = WorkflowEngine(model, registry, runtime=runtime)
+        pack_path = runtime.workspace.path / "evals" / args.pack / "pack.jsonl"
+        report_path = Path(args.report)
+        candidate_report = run_eval_pack(pack_path, agent, engine, report_path)
+        baseline_path = Path(args.baseline)
+        compare_result = {
+            "candidate_score": extract_score(candidate_report),
+            "baseline_score": None,
+            "delta": None,
+        }
+        baseline_present = baseline_path.exists()
+        if baseline_present:
+            baseline_report = load_report(baseline_path)
+            compare_result = compare(baseline_report, candidate_report)
+        else:
+            print(
+                f"Baseline report missing at {baseline_path}.",
+                file=sys.stderr,
+            )
+        passed = decide_pass(
+            compare_result,
+            min_score=args.min_score,
+            allow_regression=args.allow_regression,
+            fail_on_missing_baseline=True,
+            baseline_present=baseline_present,
+        )
+        summary = build_summary(candidate_report, compare_result, passed=passed)
+        print(render_summary(summary))
+        if not passed:
+            raise SystemExit(1)
         return
 
     if args.command == "release":
