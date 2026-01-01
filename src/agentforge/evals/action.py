@@ -338,7 +338,15 @@ def main() -> None:
             raise SystemExit(f"Eval pack not found at {pack_path}")
 
         default_mode = None if mode == "auto" else mode
-        candidate_report = run_eval_pack(pack_path, agent, engine, report_path, default_mode)
+        candidate_report = run_eval_pack(
+            pack_path,
+            agent,
+            engine,
+            report_path,
+            default_mode,
+            include_payloads=False,
+            include_metadata=False,
+        )
 
         if not baseline_path.exists():
             raise BaselineError(_baseline_missing_message())

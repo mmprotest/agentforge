@@ -109,12 +109,20 @@ def parse_subcommand(args: list[str]) -> argparse.Namespace:
 
     gate_cmd = subparsers.add_parser("gate")
     gate_sub = gate_cmd.add_subparsers(dest="gate_command", required=True)
-    gate_run = gate_sub.add_parser("run")
-    gate_run.add_argument("--pack", required=True)
-    gate_run.add_argument("--baseline", required=True)
-    gate_run.add_argument("--report", required=True)
-    gate_run.add_argument("--min-score", type=float, default=0.0)
-    gate_run.add_argument("--allow-regression", action="store_true")
+    gate_init = gate_sub.add_parser("init")
+    gate_init.add_argument("--dir", default=".")
+    gate_init.add_argument("--force", action="store_true")
+
+    gate_baseline = gate_sub.add_parser("baseline")
+    gate_baseline_sub = gate_baseline.add_subparsers(dest="gate_baseline_command", required=True)
+    gate_baseline_update = gate_baseline_sub.add_parser("update")
+    gate_baseline_update.add_argument("--config", default="gate.yml")
+    gate_baseline_update.add_argument("--out")
+    gate_baseline_update.add_argument("--diff")
+    gate_baseline_update.add_argument("--prev")
+
+    gate_check = gate_sub.add_parser("check")
+    gate_check.add_argument("--config", default="gate.yml")
 
     release = subparsers.add_parser("release")
     release_sub = release.add_subparsers(dest="release_command", required=True)
@@ -343,44 +351,47 @@ def _handle_subcommand(args: argparse.Namespace) -> None:
         return
 
     if args.command == "gate":
-        from agentforge.evals.gating import (
-            ReportSchemaError,
-            ReportVersionError,
-            compare,
-            decide_pass,
-            extract_score,
-            load_report,
-        )
-        from agentforge.evals.summary import build_summary, render_summary
+        from agentforge.gate.commands import baseline_update, gate_check, init_gate
+        from agentforge.gate.config import GateConfigError
+        from agentforge.gate.baseline import BaselineError
+        from agentforge.evals.gating import ReportSchemaError, ReportVersionError
 
         try:
-            _require_model_config(settings)
-            model = build_model(settings)
-            registry = build_registry(settings, model)
-            agent = build_agent(settings, model, registry, runtime=runtime)
-            engine = WorkflowEngine(model, registry, runtime=runtime)
-            pack_path = runtime.workspace.path / "evals" / args.pack / "pack.jsonl"
-            report_path = Path(args.report)
-            candidate_report = run_eval_pack(pack_path, agent, engine, report_path)
-            baseline_path = Path(args.baseline)
-            if not baseline_path.exists():
-                print(f"Baseline report missing at {baseline_path}.", file=sys.stderr)
-                raise SystemExit(2)
-            baseline_report = load_report(baseline_path)
-            compare_result = compare(baseline_report, candidate_report)
-            passed = decide_pass(
-                compare_result,
-                min_score=args.min_score,
-                allow_regression=args.allow_regression,
-                fail_on_missing_baseline=True,
-                baseline_present=True,
-            )
-            summary = build_summary(candidate_report, compare_result, passed=passed)
-            print(render_summary(summary))
-            if not passed:
-                raise SystemExit(1)
-            return
-        except (ReportSchemaError, ReportVersionError, ValueError) as exc:
+            if args.gate_command == "init":
+                init_gate(Path(args.dir), args.force)
+                print("ok")
+                return
+            if args.gate_command == "baseline":
+                if args.gate_baseline_command == "update":
+                    _require_model_config(settings)
+                    baseline_update(
+                        Path(args.config),
+                        Path(args.out) if args.out else None,
+                        Path(args.diff) if args.diff else None,
+                        Path(args.prev) if args.prev else None,
+                        settings=settings,
+                        runtime=runtime,
+                        build_model=build_model,
+                        build_registry=build_registry,
+                        build_agent=build_agent,
+                        workflow_engine_cls=WorkflowEngine,
+                    )
+                    print("ok")
+                    return
+            if args.gate_command == "check":
+                _require_model_config(settings)
+                gate_check(
+                    Path(args.config),
+                    settings=settings,
+                    runtime=runtime,
+                    build_model=build_model,
+                    build_registry=build_registry,
+                    build_agent=build_agent,
+                    workflow_engine_cls=WorkflowEngine,
+                )
+                return
+            raise SystemExit("Unknown gate command")
+        except (BaselineError, GateConfigError, ReportSchemaError, ReportVersionError, ValueError) as exc:
             print(f"Gate error: {exc}", file=sys.stderr)
             raise SystemExit(2) from exc
         except SystemExit:
