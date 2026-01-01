@@ -22,6 +22,33 @@ Highlights:
 
 See [docs/ai-regression-gate.md](docs/ai-regression-gate.md) for workflows and local usage.
 
+## No-Flake CI for AI
+AgentForge Gate turns evals into a strict, reproducible CI gate for AI behavior. One config file, two workflows, one command.
+
+### No-Flake Manifesto
+What we refuse to do:
+- No baseline, no run.
+- No fallbacks.
+- No payload leakage.
+- Strict schema, deterministic artifacts.
+
+### 5-minute quickstart
+```bash
+pip install "agentforge[yaml]"
+agentforge gate init
+```
+
+Set your model env vars (OpenAI-compatible endpoints supported):
+```bash
+export OPENAI_BASE_URL=http://localhost:8000
+export OPENAI_MODEL=your-model
+export OPENAI_API_KEY=local-key
+```
+
+Then:
+1. Run the **ai-baseline** workflow on `main` once to publish `baseline_report.json`.
+2. Open a PR. The **ai-regression-gate** workflow runs `agentforge gate check` and blocks regressions.
+
 ## How the agent works
 ```mermaid
 flowchart TD

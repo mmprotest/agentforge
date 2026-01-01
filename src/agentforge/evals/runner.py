@@ -44,12 +44,15 @@ def _score_case(expected: Any, actual: Any, scoring: str, schema: dict[str, Any]
     return 0.0
 
 
-def run_eval_pack(
+def build_eval_report(
     pack_path: Path,
     agent: Agent,
     workflow_engine: WorkflowEngine,
-    report_path: Path,
     default_mode: str | None = None,
+    *,
+    include_payloads: bool = True,
+    include_metadata: bool = True,
+    eval_pack_id: str | None = None,
 ) -> dict[str, Any]:
     cases = load_eval_pack(pack_path)
     results: list[EvalCaseResult] = []
@@ -88,20 +91,24 @@ def run_eval_pack(
         for result in results
         if not result.passed
     ]
-    eval_pack_id = pack_path.parent.name
+    pack_id = eval_pack_id or pack_path.parent.name
     generated_at = datetime.now(timezone.utc).isoformat()
     git_sha = os.environ.get("GITHUB_SHA")
     report = {
         "report_version": "0.1",
-        "generated_at": generated_at,
-        "git_sha": git_sha,
-        "eval_pack_id": eval_pack_id,
-        "eval_pack_name": eval_pack_id,
+        "eval_pack_id": pack_id,
+        "eval_pack_name": pack_id,
         "overall_score": overall,
         "total_cases": len(results),
         "passed_cases": passed_cases,
         "failures": failures,
-        "cases": [
+        "cases": [],
+    }
+    if include_metadata:
+        report["generated_at"] = generated_at
+        report["git_sha"] = git_sha
+    if include_payloads:
+        report["cases"] = [
             {
                 "id": result.case_id,
                 "score": result.score,
@@ -110,8 +117,39 @@ def run_eval_pack(
                 "actual": result.actual,
             }
             for result in results
-        ],
-    }
+        ]
+    else:
+        report["cases"] = [
+            {
+                "id": result.case_id,
+                "score": result.score,
+                "passed": result.passed,
+            }
+            for result in results
+        ]
+    return report
+
+
+def run_eval_pack(
+    pack_path: Path,
+    agent: Agent,
+    workflow_engine: WorkflowEngine,
+    report_path: Path,
+    default_mode: str | None = None,
+    *,
+    include_payloads: bool = True,
+    include_metadata: bool = True,
+    eval_pack_id: str | None = None,
+) -> dict[str, Any]:
+    report = build_eval_report(
+        pack_path,
+        agent,
+        workflow_engine,
+        default_mode,
+        include_payloads=include_payloads,
+        include_metadata=include_metadata,
+        eval_pack_id=eval_pack_id,
+    )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
