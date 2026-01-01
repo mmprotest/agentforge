@@ -121,6 +121,12 @@ def main() -> None:
     mode = _get_input("mode", "auto") or "auto"
     if mode not in {"agent", "workflow", "auto"}:
         raise SystemExit("mode must be agent, workflow, or auto")
+    if not fail_on_missing_baseline:
+        raise SystemExit("Unsupported: no fallbacks")
+    if not baseline_report_input:
+        raise SystemExit(
+            "Baseline report missing. Run the baseline workflow on main first (ai-baseline.yml)."
+        )
 
     os.environ.setdefault("AGENTFORGE_HOME", "/data")
     agentforge_home = Path(os.environ["AGENTFORGE_HOME"])
@@ -151,24 +157,18 @@ def main() -> None:
     min_pass, min_summary = enforce_min_score(candidate, min_score)
     gate_pass = gate_pass and min_pass
 
-    baseline_path = None
-    if baseline_report_input:
-        baseline_path = _resolve_workspace_path(baseline_report_input, workspace_root)
-    if baseline_path and baseline_path.exists():
-        baseline = load_report(baseline_path)
-        gate_pass, compare_summary = compare_reports(
-            baseline, candidate, allow_regression=allow_regression
+    baseline_path = _resolve_workspace_path(baseline_report_input, workspace_root)
+    if not baseline_path.exists():
+        raise SystemExit(
+            "Baseline report missing. Run the baseline workflow on main first (ai-baseline.yml)."
         )
-        baseline_score = compare_summary["baseline_score"]
-        delta = compare_summary["delta"]
-        gate_pass = gate_pass and min_pass
-    else:
-        if baseline_report_input and fail_on_missing_baseline:
-            gate_pass = False
-            messages.append(
-                "Baseline report missing. Generate and commit a baseline report or "
-                "set fail_on_missing_baseline=false."
-            )
+    baseline = load_report(baseline_path)
+    gate_pass, compare_summary = compare_reports(
+        baseline, candidate, allow_regression=allow_regression
+    )
+    baseline_score = compare_summary["baseline_score"]
+    delta = compare_summary["delta"]
+    gate_pass = gate_pass and min_pass
 
     candidate_score = float(candidate.get("overall_score", 0.0))
     baseline_display = "n/a" if baseline_score is None else f"{baseline_score:.4f}"

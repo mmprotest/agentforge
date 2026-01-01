@@ -10,7 +10,7 @@ inputs:
     required: true
   baseline_report:
     description: "Path to baseline report JSON"
-    required: false
+    required: true
   min_score:
     description: "Minimum allowed overall score"
     required: false
@@ -32,7 +32,7 @@ inputs:
     required: false
     default: "auto"
   fail_on_missing_baseline:
-    description: "Fail if baseline report is missing"
+    description: "Fail if baseline report is missing (must be true)"
     required: false
     default: "true"
 runs:

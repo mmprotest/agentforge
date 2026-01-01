@@ -186,6 +186,19 @@ def apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
     return Settings(**data)
 
 
+def _require_model_config(settings: Settings) -> None:
+    missing: list[str] = []
+    if not settings.openai_api_key:
+        missing.append("OPENAI_API_KEY/--api-key")
+    if not settings.openai_base_url:
+        missing.append("OPENAI_BASE_URL/--base-url")
+    if not settings.openai_model:
+        missing.append("OPENAI_MODEL/--model")
+    if missing:
+        joined = ", ".join(missing)
+        raise ValueError(f"Missing model configuration: {joined}.")
+
+
 def _load_global_config(home_dir: str) -> dict[str, Any]:
     config_path = Path(home_dir).expanduser() / "config.json"
     if not config_path.exists():
@@ -330,43 +343,51 @@ def _handle_subcommand(args: argparse.Namespace) -> None:
         return
 
     if args.command == "gate":
-        from agentforge.evals.gating import compare, decide_pass, extract_score, load_report
+        from agentforge.evals.gating import (
+            ReportSchemaError,
+            ReportVersionError,
+            compare,
+            decide_pass,
+            extract_score,
+            load_report,
+        )
         from agentforge.evals.summary import build_summary, render_summary
 
-        model = build_model(settings, use_mock=True)
-        registry = build_registry(settings, model)
-        agent = build_agent(settings, model, registry, runtime=runtime)
-        engine = WorkflowEngine(model, registry, runtime=runtime)
-        pack_path = runtime.workspace.path / "evals" / args.pack / "pack.jsonl"
-        report_path = Path(args.report)
-        candidate_report = run_eval_pack(pack_path, agent, engine, report_path)
-        baseline_path = Path(args.baseline)
-        compare_result = {
-            "candidate_score": extract_score(candidate_report),
-            "baseline_score": None,
-            "delta": None,
-        }
-        baseline_present = baseline_path.exists()
-        if baseline_present:
+        try:
+            _require_model_config(settings)
+            model = build_model(settings)
+            registry = build_registry(settings, model)
+            agent = build_agent(settings, model, registry, runtime=runtime)
+            engine = WorkflowEngine(model, registry, runtime=runtime)
+            pack_path = runtime.workspace.path / "evals" / args.pack / "pack.jsonl"
+            report_path = Path(args.report)
+            candidate_report = run_eval_pack(pack_path, agent, engine, report_path)
+            baseline_path = Path(args.baseline)
+            if not baseline_path.exists():
+                print(f"Baseline report missing at {baseline_path}.", file=sys.stderr)
+                raise SystemExit(2)
             baseline_report = load_report(baseline_path)
             compare_result = compare(baseline_report, candidate_report)
-        else:
-            print(
-                f"Baseline report missing at {baseline_path}.",
-                file=sys.stderr,
+            passed = decide_pass(
+                compare_result,
+                min_score=args.min_score,
+                allow_regression=args.allow_regression,
+                fail_on_missing_baseline=True,
+                baseline_present=True,
             )
-        passed = decide_pass(
-            compare_result,
-            min_score=args.min_score,
-            allow_regression=args.allow_regression,
-            fail_on_missing_baseline=True,
-            baseline_present=baseline_present,
-        )
-        summary = build_summary(candidate_report, compare_result, passed=passed)
-        print(render_summary(summary))
-        if not passed:
-            raise SystemExit(1)
-        return
+            summary = build_summary(candidate_report, compare_result, passed=passed)
+            print(render_summary(summary))
+            if not passed:
+                raise SystemExit(1)
+            return
+        except (ReportSchemaError, ReportVersionError, ValueError) as exc:
+            print(f"Gate error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        except SystemExit:
+            raise
+        except Exception as exc:  # pragma: no cover - safety net
+            print(f"Gate error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
 
     if args.command == "release":
         if args.release_command == "check":
