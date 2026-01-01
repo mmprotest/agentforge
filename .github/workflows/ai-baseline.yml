@@ -3,6 +3,7 @@ name: AI Baseline
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   ai-baseline:
@@ -10,14 +11,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install AgentForge
-        run: pip install -e .
-
       - name: Run baseline eval
-        run: agentforge --workspace default eval run --pack sample --report evals/baseline_report.json
+        uses: ./
+        with:
+          workspace: default
+          eval_pack: sample
+          baseline_strategy: none
+          report_out: baseline_report.json
         env:
-          AGENTFORGE_HOME: /data
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MODEL: ${{ secrets.OPENAI_MODEL }}
@@ -25,5 +26,5 @@ jobs:
       - name: Upload baseline report
         uses: actions/upload-artifact@v4
         with:
-          name: baseline-report
-          path: evals/baseline_report.json
+          name: ai-baseline-report
+          path: baseline_report.json

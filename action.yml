@@ -1,0 +1,90 @@
+name: AI Regression Gate
+description: Run AgentForge eval packs and gate on baseline regressions.
+author: AgentForge
+inputs:
+  workspace:
+    description: Workspace ID to run the eval pack in.
+    default: default
+    required: false
+  eval_pack:
+    description: Eval pack ID to run.
+    required: true
+  baseline_strategy:
+    description: Baseline strategy (none, artifact, file).
+    default: artifact
+    required: false
+  baseline_file:
+    description: Baseline report path when baseline_strategy is file.
+    default: ""
+    required: false
+  baseline_artifact_name:
+    description: Baseline artifact name to download.
+    default: ai-baseline-report
+    required: false
+  baseline_artifact_path:
+    description: Baseline report path inside the artifact.
+    default: baseline_report.json
+    required: false
+  min_score:
+    description: Minimum acceptable score for candidate report.
+    default: "0.0"
+    required: false
+  allow_regression:
+    description: Allow candidate score to be lower than baseline.
+    default: "false"
+    required: false
+  fail_on_missing_baseline:
+    description: Fail if baseline is missing.
+    default: "true"
+    required: false
+  report_out:
+    description: Output path for the candidate report JSON.
+    default: agentforge_eval_report.json
+    required: false
+  mode:
+    description: Eval mode override (agent, workflow, auto).
+    default: auto
+    required: false
+  agentforge_args:
+    description: Additional AgentForge CLI-compatible args.
+    default: ""
+    required: false
+outputs:
+  candidate_score:
+    description: Candidate overall score.
+    value: ${{ steps.gate.outputs.candidate_score }}
+  baseline_score:
+    description: Baseline overall score.
+    value: ${{ steps.gate.outputs.baseline_score }}
+  delta_score:
+    description: Candidate minus baseline score.
+    value: ${{ steps.gate.outputs.delta_score }}
+  report_path:
+    description: Path to the candidate report JSON.
+    value: ${{ steps.gate.outputs.report_path }}
+  pass:
+    description: true if gate passed, false otherwise.
+    value: ${{ steps.gate.outputs.pass }}
+runs:
+  using: composite
+  steps:
+    - name: Install AgentForge
+      shell: bash
+      run: python -m pip install .
+    - name: Run AI Regression Gate
+      id: gate
+      shell: bash
+      env:
+        INPUT_WORKSPACE: ${{ inputs.workspace }}
+        INPUT_EVAL_PACK: ${{ inputs.eval_pack }}
+        INPUT_BASELINE_STRATEGY: ${{ inputs.baseline_strategy }}
+        INPUT_BASELINE_FILE: ${{ inputs.baseline_file }}
+        INPUT_BASELINE_ARTIFACT_NAME: ${{ inputs.baseline_artifact_name }}
+        INPUT_BASELINE_ARTIFACT_PATH: ${{ inputs.baseline_artifact_path }}
+        INPUT_MIN_SCORE: ${{ inputs.min_score }}
+        INPUT_ALLOW_REGRESSION: ${{ inputs.allow_regression }}
+        INPUT_FAIL_ON_MISSING_BASELINE: ${{ inputs.fail_on_missing_baseline }}
+        INPUT_REPORT_OUT: ${{ inputs.report_out }}
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_AGENTFORGE_ARGS: ${{ inputs.agentforge_args }}
+      run: python -m agentforge.evals.action

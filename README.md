@@ -1,5 +1,7 @@
 # AgentForge
 
+[![CI](https://github.com/agentforge/agentforge/actions/workflows/ci.yml/badge.svg)](https://github.com/agentforge/agentforge/actions/workflows/ci.yml)
+
 AgentForge is a production-ready Python 3.11+ repository that implements an agent capable of using tools and creating tools with an OpenAI-compatible model backend.
 
 ## Features
@@ -9,6 +11,16 @@ AgentForge is a production-ready Python 3.11+ repository that implements an agen
 - Pack management for signed tool/workflow bundles (HMAC default).
 - Built-in tools and connectors: HTTP fetch, workspace filesystem, Python sandbox, calculator, regex extract, unit conversion, JSON repair, multi-file code runner, filesystem/SQL/PDF/email connectors.
 - CLI, FastAPI server, and eval gating for release checks.
+
+## AI Regression Gate
+AgentForge ships a GitHub Action that runs eval packs and blocks regressions against a baseline.
+
+Highlights:
+- Publishable root action (`action.yml`) with stable inputs/outputs.
+- Baseline artifact strategy with automatic download from the default branch.
+- Clear GitHub summary with totals, scores, and top failing case IDs.
+
+See [docs/ai-regression-gate.md](docs/ai-regression-gate.md) for workflows and local usage.
 
 ## How the agent works
 ```mermaid
