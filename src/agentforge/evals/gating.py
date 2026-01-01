@@ -14,9 +14,13 @@ class ReportVersionError(ValueError):
     """Raised when the report_version is missing or unsupported."""
 
 
+class ReportSchemaError(ValueError):
+    """Raised when the report schema is invalid."""
+
+
 def load_report(path: Path) -> dict[str, Any]:
     report = json.loads(path.read_text(encoding="utf-8"))
-    _validate_report_version(report)
+    _validate_report_schema(report)
     return report
 
 
@@ -30,9 +34,26 @@ def _validate_report_version(report: dict[str, Any]) -> None:
         )
 
 
-def extract_score(report: dict[str, Any]) -> float:
+def _validate_report_schema(report: dict[str, Any]) -> float:
     _validate_report_version(report)
-    return float(report.get("overall_score", 0.0))
+    if "overall_score" not in report:
+        raise ReportSchemaError("Report is missing required overall_score.")
+    score = report.get("overall_score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        raise ReportSchemaError("overall_score must be a number between 0 and 1.")
+    score_value = float(score)
+    if not 0.0 <= score_value <= 1.0:
+        raise ReportSchemaError("overall_score must be between 0 and 1.")
+    if "failures" not in report:
+        raise ReportSchemaError("Report is missing required failures list.")
+    failures = report.get("failures")
+    if not isinstance(failures, list):
+        raise ReportSchemaError("failures must be a list.")
+    return score_value
+
+
+def extract_score(report: dict[str, Any]) -> float:
+    return _validate_report_schema(report)
 
 
 def compare(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
@@ -87,6 +108,7 @@ def enforce_min_score(candidate: dict[str, Any], min_score: float) -> tuple[bool
 
 
 def extract_failures(report: dict[str, Any], limit: int = 5) -> list[str]:
+    _validate_report_schema(report)
     failures: list[str] = []
     for item in report.get("failures", []) or []:
         case_id = str(item.get("id", "case"))

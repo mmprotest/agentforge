@@ -17,7 +17,14 @@ from typing import Any
 
 from agentforge.cli import _load_global_config, apply_overrides
 from agentforge.config import Settings
-from agentforge.evals.gating import compare, decide_pass, extract_score, load_report
+from agentforge.evals.gating import (
+    ReportSchemaError,
+    ReportVersionError,
+    compare,
+    decide_pass,
+    extract_score,
+    load_report,
+)
 from agentforge.evals.runner import run_eval_pack
 from agentforge.evals.summary import build_summary, render_summary
 from agentforge.factory import build_agent, build_model, build_registry
@@ -31,6 +38,9 @@ SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD")
 
 class BaselineError(RuntimeError):
     pass
+
+
+BASELINE_WORKFLOW_FILE = "ai-baseline.yml"
 
 
 def _parse_bool(value: str) -> bool:
@@ -74,6 +84,19 @@ def _log_env(keys: list[str]) -> None:
     }
     if details:
         print(f"Environment: {details}")
+
+
+def _require_model_config(settings: Settings) -> None:
+    missing: list[str] = []
+    if not settings.openai_api_key:
+        missing.append("OPENAI_API_KEY")
+    if not settings.openai_base_url:
+        missing.append("OPENAI_BASE_URL")
+    if not settings.openai_model:
+        missing.append("OPENAI_MODEL")
+    if missing:
+        joined = ", ".join(missing)
+        raise ValueError(f"Missing model configuration: {joined}.")
 
 
 def _parse_agentforge_args(arg_string: str) -> argparse.Namespace:
@@ -136,6 +159,13 @@ def _github_api_request(url: str, token: str) -> dict[str, Any]:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _baseline_missing_message() -> str:
+    return (
+        "Baseline report missing. Run the baseline workflow on main first "
+        f"({BASELINE_WORKFLOW_FILE})."
+    )
+
+
 def _download_artifact_zip(url: str, token: str, destination: Path) -> None:
     request = urllib.request.Request(
         url,
@@ -157,28 +187,40 @@ def _resolve_baseline_from_artifact(
     if not token or not repo:
         raise BaselineError("GITHUB_TOKEN and GITHUB_REPOSITORY are required to fetch artifacts.")
     api_root = "https://api.github.com"
-    repo_data = _github_api_request(f"{api_root}/repos/{repo}", token)
+    try:
+        repo_data = _github_api_request(f"{api_root}/repos/{repo}", token)
+    except urllib.error.URLError as exc:
+        raise BaselineError(f"Baseline artifact fetch failed: {exc}") from exc
     default_branch = repo_data.get("default_branch", "main")
-    workflow_runs = _github_api_request(
-        f"{api_root}/repos/{repo}/actions/workflows/ai-baseline.yml/runs?"
-        + urllib.parse.urlencode({"branch": default_branch, "status": "success", "per_page": 1}),
-        token,
-    )
+    try:
+        workflow_runs = _github_api_request(
+            f"{api_root}/repos/{repo}/actions/workflows/{BASELINE_WORKFLOW_FILE}/runs?"
+            + urllib.parse.urlencode({"branch": default_branch, "status": "success", "per_page": 1}),
+            token,
+        )
+    except urllib.error.URLError as exc:
+        raise BaselineError(f"Baseline artifact fetch failed: {exc}") from exc
     runs = workflow_runs.get("workflow_runs", [])
     if not runs:
-        raise BaselineError("No successful ai-baseline.yml runs found on default branch.")
+        raise BaselineError(_baseline_missing_message())
     run_id = runs[0]["id"]
-    artifacts = _github_api_request(
-        f"{api_root}/repos/{repo}/actions/runs/{run_id}/artifacts", token
-    ).get("artifacts", [])
+    try:
+        artifacts = _github_api_request(
+            f"{api_root}/repos/{repo}/actions/runs/{run_id}/artifacts", token
+        ).get("artifacts", [])
+    except urllib.error.URLError as exc:
+        raise BaselineError(f"Baseline artifact fetch failed: {exc}") from exc
     match = next((item for item in artifacts if item.get("name") == artifact_name), None)
     if not match:
-        raise BaselineError(f"Baseline artifact {artifact_name!r} not found in run {run_id}.")
+        raise BaselineError(_baseline_missing_message())
     with tempfile.TemporaryDirectory() as tmp_dir:
         zip_path = Path(tmp_dir) / "artifact.zip"
-        _download_artifact_zip(
-            f"{api_root}/repos/{repo}/actions/artifacts/{match['id']}/zip", token, zip_path
-        )
+        try:
+            _download_artifact_zip(
+                f"{api_root}/repos/{repo}/actions/artifacts/{match['id']}/zip", token, zip_path
+            )
+        except urllib.error.URLError as exc:
+            raise BaselineError(f"Baseline artifact fetch failed: {exc}") from exc
         extract_dir = Path(tmp_dir) / "extracted"
         extract_dir.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zip_path) as handle:
@@ -193,32 +235,13 @@ def _resolve_baseline_from_artifact(
             artifact_path.parent.mkdir(parents=True, exist_ok=True)
             artifact_path.write_bytes(fallback.read_bytes())
             return artifact_path
-    raise BaselineError(
-        f"Baseline artifact {artifact_name!r} does not contain {artifact_path.name}."
-    )
+    raise BaselineError(_baseline_missing_message())
 
 
-def _prepare_baseline(
-    strategy: str,
-    baseline_file: str,
-    artifact_name: str,
-    artifact_path: str,
-) -> tuple[bool, Path | None]:
-    if strategy == "none":
-        return False, None
-    if strategy == "file":
-        path = Path(baseline_file)
-        if path.exists():
-            return True, path
-        return False, path
-    if strategy == "artifact":
-        try:
-            path = _resolve_baseline_from_artifact(artifact_name, Path(artifact_path))
-            return True, path
-        except (BaselineError, urllib.error.URLError) as exc:
-            print(f"Baseline artifact fetch failed: {exc}", file=sys.stderr)
-            return False, Path(artifact_path)
-    raise BaselineError(f"Unknown baseline_strategy {strategy!r}.")
+def _prepare_baseline(strategy: str, artifact_name: str, artifact_path: str) -> Path:
+    if strategy != "artifact":
+        raise BaselineError(f"Unsupported baseline_strategy {strategy!r}.")
+    return _resolve_baseline_from_artifact(artifact_name, Path(artifact_path))
 
 
 def main() -> None:
@@ -227,7 +250,6 @@ def main() -> None:
     if not eval_pack:
         raise SystemExit("eval_pack input is required.")
     baseline_strategy = _get_input("baseline_strategy", "artifact")
-    baseline_file = _get_input("baseline_file", "")
     baseline_artifact_name = _get_input("baseline_artifact_name", "ai-baseline-report")
     baseline_artifact_path = _get_input("baseline_artifact_path", "baseline_report.json")
     min_score = float(_get_input("min_score", "0.0") or 0.0)
@@ -238,53 +260,48 @@ def main() -> None:
     agentforge_args = _get_input("agentforge_args", "")
 
     print("AI Regression Gate starting.")
-    _log_env(["OPENAI_BASE_URL", "OPENAI_API_KEY", "MODEL"])
+    _log_env(["OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"])
 
-    settings, runtime = _build_runtime(workspace, agentforge_args)
-    model = build_model(settings)
-    registry = build_registry(settings, model)
-    agent = build_agent(settings, model, registry, runtime=runtime)
-    engine = WorkflowEngine(model, registry, runtime=runtime)
-    pack_path = runtime.workspace.path / "evals" / eval_pack / "pack.jsonl"
-    report_path = Path(report_out)
-    if not pack_path.exists():
-        raise SystemExit(f"Eval pack not found at {pack_path}")
+    if not fail_on_missing_baseline:
+        raise SystemExit("Unsupported: no fallbacks")
+    if baseline_strategy != "artifact":
+        raise SystemExit(f"Unsupported baseline_strategy {baseline_strategy!r}.")
 
-    default_mode = None if mode == "auto" else mode
-    candidate_report = run_eval_pack(pack_path, agent, engine, report_path, default_mode)
+    try:
+        settings, runtime = _build_runtime(workspace, agentforge_args)
+        _require_model_config(settings)
+        baseline_path = _prepare_baseline(
+            baseline_strategy,
+            baseline_artifact_name,
+            baseline_artifact_path,
+        )
+        model = build_model(settings)
+        registry = build_registry(settings, model)
+        agent = build_agent(settings, model, registry, runtime=runtime)
+        engine = WorkflowEngine(model, registry, runtime=runtime)
+        pack_path = runtime.workspace.path / "evals" / eval_pack / "pack.jsonl"
+        report_path = Path(report_out)
+        if not pack_path.exists():
+            raise SystemExit(f"Eval pack not found at {pack_path}")
 
-    if baseline_strategy == "none":
-        fail_on_missing_baseline = False
+        default_mode = None if mode == "auto" else mode
+        candidate_report = run_eval_pack(pack_path, agent, engine, report_path, default_mode)
 
-    baseline_present, baseline_path = _prepare_baseline(
-        baseline_strategy,
-        baseline_file,
-        baseline_artifact_name,
-        baseline_artifact_path,
-    )
+        if not baseline_path.exists():
+            raise BaselineError(_baseline_missing_message())
 
-    compare_result: dict[str, Any] = {
-        "candidate_score": extract_score(candidate_report),
-        "baseline_score": None,
-        "delta": None,
-    }
-    if baseline_present and baseline_path and baseline_path.exists():
         baseline_report = load_report(baseline_path)
         compare_result = compare(baseline_report, candidate_report)
-    else:
-        if fail_on_missing_baseline and baseline_strategy != "none":
-            print(
-                "Baseline report missing. Run ai-baseline.yml on the default branch to create one.",
-                file=sys.stderr,
-            )
 
-    passed = decide_pass(
-        compare_result,
-        min_score=min_score,
-        allow_regression=allow_regression,
-        fail_on_missing_baseline=fail_on_missing_baseline,
-        baseline_present=baseline_present and baseline_path is not None and baseline_path.exists(),
-    )
+        passed = decide_pass(
+            compare_result,
+            min_score=min_score,
+            allow_regression=allow_regression,
+            fail_on_missing_baseline=True,
+            baseline_present=True,
+        )
+    except (BaselineError, ReportSchemaError, ReportVersionError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
     summary = build_summary(candidate_report, compare_result, passed=passed)
     _write_summary(render_summary(summary))

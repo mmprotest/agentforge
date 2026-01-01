@@ -11,17 +11,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Install AgentForge
+        run: python -m pip install .
       - name: Run baseline eval
-        uses: ./
-        with:
-          workspace: default
-          eval_pack: sample
-          baseline_strategy: none
-          report_out: baseline_report.json
+        run: agentforge --workspace default eval run --pack sample --report baseline_report.json
         env:
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          MODEL: ${{ secrets.OPENAI_MODEL }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
       - name: Upload baseline report
         uses: actions/upload-artifact@v4

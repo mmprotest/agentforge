@@ -17,18 +17,16 @@ jobs:
         with:
           workspace: default
           eval_pack: sample
-          baseline_strategy: artifact
-          min_score: "0.6"
           report_out: agentforge_eval_report.json
           allow_regression: "false"
-          fail_on_missing_baseline: "true"
         env:
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          MODEL: ${{ secrets.OPENAI_MODEL }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
       - name: Upload eval report
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: agentforge-eval-report
           path: agentforge_eval_report.json

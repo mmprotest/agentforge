@@ -4,6 +4,7 @@ import json
 import pytest
 
 from agentforge.evals.gating import (
+    ReportSchemaError,
     ReportVersionError,
     compare,
     decide_pass,
@@ -13,16 +14,16 @@ from agentforge.evals.gating import (
 
 
 def test_compare_candidate_better_passes() -> None:
-    baseline = {"report_version": "0.1", "overall_score": 0.5}
-    candidate = {"report_version": "0.1", "overall_score": 0.7}
+    baseline = {"report_version": "0.1", "overall_score": 0.5, "failures": []}
+    candidate = {"report_version": "0.1", "overall_score": 0.7, "failures": []}
     summary = compare(baseline, candidate)
     assert summary["delta"] == pytest.approx(0.2)
     assert summary["pass_reason"] == "no_regression"
 
 
 def test_compare_candidate_worse_regression() -> None:
-    baseline = {"report_version": "0.1", "overall_score": 0.8}
-    candidate = {"report_version": "0.1", "overall_score": 0.6}
+    baseline = {"report_version": "0.1", "overall_score": 0.8, "failures": []}
+    candidate = {"report_version": "0.1", "overall_score": 0.6, "failures": []}
     summary = compare(baseline, candidate)
     assert summary["delta"] == pytest.approx(-0.2)
     assert summary["pass_reason"] == "regression"
@@ -31,7 +32,8 @@ def test_compare_candidate_worse_regression() -> None:
 def test_missing_baseline_uses_min_score(tmp_path: Path) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(
-        json.dumps({"report_version": "0.1", "overall_score": 0.4}), encoding="utf-8"
+        json.dumps({"report_version": "0.1", "overall_score": 0.4, "failures": []}),
+        encoding="utf-8",
     )
     candidate = load_report(report_path)
     passed, summary = enforce_min_score(candidate, min_score=0.5)
@@ -85,6 +87,28 @@ def test_decide_pass_missing_baseline_respects_flag() -> None:
 
 def test_report_version_mismatch_raises(tmp_path: Path) -> None:
     report_path = tmp_path / "report.json"
-    report_path.write_text(json.dumps({"report_version": "0.0"}), encoding="utf-8")
+    report_path.write_text(
+        json.dumps({"report_version": "0.0", "overall_score": 0.2, "failures": []}),
+        encoding="utf-8",
+    )
     with pytest.raises(ReportVersionError):
+        load_report(report_path)
+
+
+def test_missing_failures_raises(tmp_path: Path) -> None:
+    report_path = tmp_path / "report.json"
+    report_path.write_text(
+        json.dumps({"report_version": "0.1", "overall_score": 0.2}), encoding="utf-8"
+    )
+    with pytest.raises(ReportSchemaError):
+        load_report(report_path)
+
+
+def test_invalid_score_range_raises(tmp_path: Path) -> None:
+    report_path = tmp_path / "report.json"
+    report_path.write_text(
+        json.dumps({"report_version": "0.1", "overall_score": 1.5, "failures": []}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ReportSchemaError):
         load_report(report_path)

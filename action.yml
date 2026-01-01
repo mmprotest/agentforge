@@ -10,12 +10,8 @@ inputs:
     description: Eval pack ID to run.
     required: true
   baseline_strategy:
-    description: Baseline strategy (none, artifact, file).
+    description: Baseline strategy (artifact only).
     default: artifact
-    required: false
-  baseline_file:
-    description: Baseline report path when baseline_strategy is file.
-    default: ""
     required: false
   baseline_artifact_name:
     description: Baseline artifact name to download.
@@ -78,7 +74,6 @@ runs:
         INPUT_WORKSPACE: ${{ inputs.workspace }}
         INPUT_EVAL_PACK: ${{ inputs.eval_pack }}
         INPUT_BASELINE_STRATEGY: ${{ inputs.baseline_strategy }}
-        INPUT_BASELINE_FILE: ${{ inputs.baseline_file }}
         INPUT_BASELINE_ARTIFACT_NAME: ${{ inputs.baseline_artifact_name }}
         INPUT_BASELINE_ARTIFACT_PATH: ${{ inputs.baseline_artifact_path }}
         INPUT_MIN_SCORE: ${{ inputs.min_score }}
